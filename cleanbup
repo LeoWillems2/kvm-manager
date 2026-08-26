@@ -1,0 +1,267 @@
+#!/bin/bash
+#
+# cleanbup - maak ruimte vrij in de backup-directory voor een nieuwe backup.
+#
+# Elke top-level directory in BUPDIR is een backup, genaamd:
+#     <naam>-<YYYYMMDD>-<HHMMSS>      bijv. haproxy-20260822-201246
+#
+# De gasten waar het om gaat staan op de commandoregel. Er wordt ruimte
+# gecreeerd ter grootte van (grootste backup van die gasten * 1.5) door hun
+# oudste backup(s) te verwijderen. Van elke <naam> blijven minimaal MIN_KEEP
+# versies staan.
+#
+# Alleen backups van de opgegeven gasten worden aangeraakt. Backups van
+# andere gasten tellen wel mee in het beeld - ze bezetten schijfruimte - maar
+# worden nooit verwijderd: wie ze wil opruimen noemt die gast expliciet.
+#
+# Exit 0 = gelukt (er is genoeg ruimte, eventueel na opruimen), anders exit 1.
+
+set -u
+set -o pipefail
+
+BUPDIR="/t2/kvm-bup"
+FACTOR_NUM=3          # vermenigvuldigingsfactor als breuk: 3/2 = 1.5
+FACTOR_DEN=2
+MIN_KEEP=2            # minimaal aantal versies dat per backup-set blijft staan
+
+DRY_RUN=0
+SIMULATE_FREE=""      # alleen i.c.m. --dry-run: doe alsof dit het aantal vrije KB is
+
+PROG="${0##*/}"
+
+usage() {
+    cat <<USAGE
+Gebruik: $PROG [opties] <gast> [gast ...]
+
+Maakt ruimte vrij voor een nieuwe backup van de genoemde gasten door hun
+oudste backups te verwijderen. Backups van andere gasten blijven staan.
+
+  --dry-run           Toon wat er zou gebeuren, verwijder niets.
+  --dir DIR           Backup-directory (default: $BUPDIR).
+  --simulate-free KB  Doe alsof er KB vrij is (alleen samen met --dry-run,
+                      bedoeld om de opruim-logica te testen).
+  --help              Deze tekst.
+USAGE
+}
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+# ---------------------------------------------------------------- argumenten
+GASTEN=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)       DRY_RUN=1 ;;
+        --dir)           [ $# -ge 2 ] || die "--dir vereist een argument"
+                         BUPDIR="$2"; shift ;;
+        --simulate-free) [ $# -ge 2 ] || die "--simulate-free vereist een argument"
+                         SIMULATE_FREE="$2"; shift ;;
+        --help|-h)       usage; exit 0 ;;
+        --)              shift
+                         while [ $# -gt 0 ]; do GASTEN+=("$1"); shift; done
+                         break ;;
+        -*)              usage >&2; die "onbekende optie: $1" ;;
+        *)               GASTEN+=("$1") ;;
+    esac
+    shift
+done
+
+if [ "${#GASTEN[@]}" -eq 0 ]; then
+    usage >&2
+    die "geef minstens een gast op; zonder gast is er niets om ruimte voor te maken"
+fi
+
+# Staat deze backup-set op de lijst van de aanroeper?
+van_ons() {
+    local naam="$1" gast
+    for gast in "${GASTEN[@]}"; do
+        [ "$gast" = "$naam" ] && return 0
+    done
+    return 1
+}
+
+case "$SIMULATE_FREE" in
+    "") ;;
+    *[!0-9]*) die "--simulate-free verwacht een geheel getal (KB)" ;;
+esac
+if [ -n "$SIMULATE_FREE" ] && [ "$DRY_RUN" -ne 1 ]; then
+    die "--simulate-free kan alleen samen met --dry-run"
+fi
+
+[ -d "$BUPDIR" ] || die "backup-directory bestaat niet: $BUPDIR"
+
+# ------------------------------------------------------- backups inventariseren
+# Naam-patroon: <set>-<YYYYMMDD>-<HHMMSS>
+PATTERN='^(.+)-([0-9]{8})-([0-9]{6})$'
+
+names=()        # directorynaam
+sets=()         # set-naam (deel voor de timestamp)
+stamps=()       # YYYYMMDDHHMMSS, sorteerbaar als string
+sizes=()        # grootte in KB
+mag_weg=()      # 1 = van een opgegeven gast, dus kandidaat om te wissen
+
+largest=0       # grootste backup van de opgegeven gasten
+largest_alle=0  # grootste backup ongeacht gast, als schatting achter de hand
+eigen=0         # aantal backups van de opgegeven gasten
+skipped=0
+
+while IFS=$'\t' read -r size path; do
+    [ -n "${path:-}" ] || continue
+    path="${path%/}"
+    base="${path##*/}"
+    if [[ ! "$base" =~ $PATTERN ]]; then
+        warn "overgeslagen (naam volgt niet <naam>-YYYYMMDD-HHMMSS): $base"
+        skipped=$((skipped + 1))
+        continue
+    fi
+    names+=("$base")
+    sets+=("${BASH_REMATCH[1]}")
+    stamps+=("${BASH_REMATCH[2]}${BASH_REMATCH[3]}")
+    sizes+=("$size")
+
+    if van_ons "${BASH_REMATCH[1]}"; then
+        mag_weg+=(1)
+        eigen=$((eigen + 1))
+        [ "$size" -gt "$largest" ] && largest="$size"
+    else
+        mag_weg+=(0)
+    fi
+    [ "$size" -gt "$largest_alle" ] && largest_alle="$size"
+done < <(cd "$BUPDIR" && du -sk -- */ 2>/dev/null)
+
+if [ "${#names[@]}" -eq 0 ]; then
+    log "Nog geen enkele backup in $BUPDIR; niets op te ruimen."
+    exit 0
+fi
+
+# --------------------------------------------------------- benodigde ruimte
+# (grootste backup * 1.5), naar boven afgerond.
+#
+# Maatstaf is de grootste backup van de opgegeven gasten: die komt er zo
+# ongeveer weer bij. Kent de gast nog geen backup, dan is er niets te meten
+# en is de grootste backup die er ligt de beste schatting.
+if [ "$largest" -eq 0 ]; then
+    log "Nog geen backup van: ${GASTEN[*]}"
+    log "Maatstaf wordt de grootste backup die er ligt ($largest_alle KB)."
+    log ""
+    largest="$largest_alle"
+fi
+
+needed=$(( (largest * FACTOR_NUM + FACTOR_DEN - 1) / FACTOR_DEN ))
+
+if [ -n "$SIMULATE_FREE" ]; then
+    free="$SIMULATE_FREE"
+else
+    free=$(df -k -P -- "$BUPDIR" | awk 'NR==2 {print $4}')
+fi
+case "${free:-}" in
+    ""|*[!0-9]*) die "kan vrije ruimte niet bepalen voor $BUPDIR" ;;
+esac
+
+log "Backup-directory : $BUPDIR"
+log "Gasten           : ${GASTEN[*]}"
+log "Aantal backups   : ${#names[@]} (waarvan $eigen van deze gasten)"
+log "Grootste backup  : $largest KB"
+log "Benodigd (x1.5)  : $needed KB"
+log "Vrij beschikbaar : $free KB${SIMULATE_FREE:+ (gesimuleerd)}"
+[ "$DRY_RUN" -eq 1 ] && log "Modus            : DRY-RUN (er wordt niets verwijderd)"
+log ""
+
+if [ "$free" -ge "$needed" ]; then
+    log "Er is al genoeg vrije ruimte; niets te doen."
+    exit 0
+fi
+
+log "Tekort           : $((needed - free)) KB"
+log ""
+
+# --------------------------------------------- kandidaten voor verwijdering
+# Alleen backups van de opgegeven gasten komen in aanmerking; van andere
+# gasten blijft alles staan, hoe oud ook. Per set de nieuwste MIN_KEEP
+# versies beschermen; de rest is kandidaat.
+# Kandidaten oplopend op timestamp: oudste eerst.
+candidates=()
+while IFS=$'\t' read -r _stamp idx; do
+    candidates+=("$idx")
+done < <(
+    for i in "${!names[@]}"; do
+        [ "${mag_weg[$i]}" -eq 1 ] || continue
+        printf '%s\t%s\t%s\n' "${sets[$i]}" "${stamps[$i]}" "$i"
+    done |
+    sort -t$'\t' -k1,1 -k2,2r |
+    awk -F'\t' -v keep="$MIN_KEEP" '
+        $1 != prev { prev = $1; n = 0 }
+        { n++ ; if (n > keep) print $2 "\t" $3 }
+    ' |
+    sort -t$'\t' -k1,1
+)
+
+if [ "${#candidates[@]}" -eq 0 ]; then
+    warn "onvoldoende ruimte en geen enkele backup van ${GASTEN[*]} mag weg"
+    warn "(minimaal $MIN_KEEP versies per backup-set; andere gasten blijven onaangeroerd)"
+    exit 1
+fi
+
+# ------------------------------------------------------------- selecteren
+selected=()
+reclaim=0
+for idx in "${candidates[@]}"; do
+    [ $((free + reclaim)) -ge "$needed" ] && break
+    selected+=("$idx")
+    reclaim=$((reclaim + sizes[idx]))
+done
+
+if [ $((free + reclaim)) -lt "$needed" ]; then
+    warn "onvoldoende ruimte: maximaal $reclaim KB vrij te maken, $((needed - free)) KB nodig"
+    warn "(minimaal $MIN_KEEP versies per backup-set blijven staan; alleen"
+    warn " backups van ${GASTEN[*]} mogen weg)"
+    for idx in "${selected[@]}"; do
+        warn "  zou verwijderd zijn: ${names[$idx]} (${sizes[$idx]} KB)"
+    done
+    exit 1
+fi
+
+# ------------------------------------------------------------- verwijderen
+rc=0
+for idx in "${selected[@]}"; do
+    target="$BUPDIR/${names[$idx]}"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] zou verwijderen: $target (${sizes[$idx]} KB)"
+    else
+        log "verwijderen: $target (${sizes[$idx]} KB)"
+        if ! rm -rf -- "$target"; then
+            warn "verwijderen mislukt: $target"
+            rc=1
+        fi
+    fi
+done
+
+log ""
+log "Vrij te maken    : $reclaim KB"
+log "Vrij na opruimen : $((free + reclaim)) KB (nodig: $needed KB)"
+
+if [ "$rc" -ne 0 ]; then
+    warn "niet alle backups konden verwijderd worden"
+    exit 1
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    log "Dry-run voltooid."
+    exit 0
+fi
+
+# controle achteraf op de echte situatie
+free_now=$(df -k -P -- "$BUPDIR" | awk 'NR==2 {print $4}')
+case "${free_now:-}" in
+    ""|*[!0-9]*) die "kan vrije ruimte na opruimen niet bepalen" ;;
+esac
+log "Werkelijk vrij   : $free_now KB"
+if [ "$free_now" -lt "$needed" ]; then
+    warn "na opruimen nog steeds onvoldoende ruimte"
+    exit 1
+fi
+
+log "Klaar."
+exit 0

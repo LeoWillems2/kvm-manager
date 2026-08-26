@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+#
+# bupvms - herstelpakket van elke gast naar /t2/kvm-bup.
+#
+# Per gast: de definities vastleggen, snapshot maken (de bodem staat daarna
+# stil), de bodem kopiëren terwijl snapshot.sh de grendel vasthoudt, en het
+# snapshot weer samenvoegen.
+# De gast draait de hele tijd door; alleen tijdens het maken van het snapshot
+# staat het filesystem in de gast een fractie van een seconde stil.
+#
+# De kopie is consistent zoals een nette stroomonderbreking dat is: --quiesce
+# synct en bevriest het filesystem vóór het snapshot valt, dus InnoDB doet bij
+# het terugzetten redo-recovery en komt schoon op. Zie de kop van snapshot.sh.
+#
+# Gebruik:
+#   sudo ./bupvms isms lewi       # deze gasten
+#   sudo ./bupvms                 # de lijst in ALL; leeg, dus dat is een fout
+#
+# Wat er per gast wordt weggeschreven - een qcow2 zonder XML is een schijf
+# zonder machine, zie HERSTEL.md:
+#
+#   /t2/kvm-bup/{naam}-JJJJMMDD-UUMMSS/
+#       schijf/{naam}.qcow2
+#       definitie/domein.xml            virsh dumpxml --inactive
+#       definitie/netwerk-{net}.xml     per netwerk waar de gast aan hangt
+#       definitie/nvram.fd              alleen bij UEFI
+#       manifest.txt
+#       LEESMIJ.txt
+#       herstel.sh + HERSTEL.md    het gereedschap gaat mee het pakket in
+#
+# De definities worden vastgelegd VOORDAT het snapshot valt. Zolang een
+# snapshot openstaat wijst de opgeslagen definitie namelijk naar de overlay
+# met de bodem als <backingStore> eronder; die overlay bestaat na het
+# samenvoegen niet meer.
+#
+# Voor cron (draait daar al als root):
+#   17 3 * * *  /home/leo/claude/makevm-2604/bupvms >>/var/log/bupvms.log 2>&1
+#
+# Wat er misgaat wordt niet stilzwijgend overgeslagen: een gast die faalt komt
+# in het eindoverzicht en de exitcode is dan 1, maar de andere gasten worden
+# wel afgemaakt.
+
+set -Eeuo pipefail
+
+########################################################################
+# INSTELLINGEN
+########################################################################
+
+ALL=""                      # standaardlijst; leeg = altijd gasten als argument
+DOEL="/t2/kvm-bup"          # hier komen de kopieën
+BEWAAR=3                    # zoveel kopieën per gast bewaren
+MARGE_GB=5                  # zoveel GB vrij willen houden op ${DOEL}
+GRENDEL="/run/lock/bupvms.grendel"
+CONTROLEER="ja"             # qemu-img check over de kopie voordat hij meetelt
+HASH="ja"                   # sha256 van de kopie in het manifest (kost een leesronde)
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+ZELF="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
+SNAPSHOT="${SCRIPT_DIR}/snapshot.sh"
+
+########################################################################
+# MELDINGEN
+########################################################################
+
+melding() { printf '%s [bupvms] %s: %s\n' "$(date +%Y-%m-%dT%H:%M:%S%:z)" "$1" "$2"; }
+fout()    { melding "$1" "FOUT: $2" >&2; }
+
+# Wat er openstaat als dit script onverwacht stopt. Een blijvende overlay
+# groeit door en de volgende run weigert erop, dus die wordt alsnog
+# samengevoegd; lukt dat niet, dan staat hier wat u met de hand moet doen.
+HUIDIG_DOM=""
+HUIDIG_SNAP=""
+opruimen_bij_afsluiten() {
+    local rc=$?
+    [[ -n "$HUIDIG_SNAP" ]] || return 0
+    melding "$HUIDIG_DOM" "WAARSCHUWING: snapshot '${HUIDIG_SNAP}' staat nog open, alsnog samenvoegen"
+    if ! "$SNAPSHOT" -y -d "$HUIDIG_DOM" opruimen "$HUIDIG_SNAP"; then
+        fout "$HUIDIG_DOM" "samenvoegen mislukt; doe met de hand: sudo ${SNAPSHOT} -d ${HUIDIG_DOM} opruimen ${HUIDIG_SNAP}"
+    fi
+    HUIDIG_SNAP=""
+    return "$rc"
+}
+
+########################################################################
+# DE KOPIE ZELF
+#
+# Dit deel draait als payload binnen "snapshot.sh backup", dus met de
+# grendel vast: zolang deze kopie loopt voegt niemand de overlay samen en
+# verandert de bodem-image niet.
+########################################################################
+
+kopieer() {
+    local dom="$1" bodem="$2" bundel="$3" snapnaam="$4"
+    local doelbestand tijdelijk bron_bytes kopie_bytes rc
+
+    [[ -r "$bodem" ]] || { fout "$dom" "kan ${bodem} niet lezen"; return 1; }
+    [[ -d "${bundel}/definitie" ]] || { fout "$dom" "pakket ${bundel} is niet voorbereid"; return 1; }
+
+    doelbestand="${bundel}/schijf/$(basename -- "$bodem")"
+    tijdelijk="${doelbestand}.bezig"
+
+    # Een halve kopie mag nooit blijven liggen en al helemaal niet meetellen
+    # als backup; daarom eerst een .bezig-naam en pas hernoemen als hij klopt.
+    trap 'rm -f -- "'"$tijdelijk"'"' EXIT
+
+    melding "$dom" "kopiëren: ${bodem} -> ${doelbestand}"
+    if ! cp --sparse=always -- "$bodem" "$tijdelijk"; then
+        fout "$dom" "kopiëren mislukt"
+        return 1
+    fi
+
+    bron_bytes="$(stat -c %s -- "$bodem")"
+    kopie_bytes="$(stat -c %s -- "$tijdelijk")"
+    if [[ "$bron_bytes" != "$kopie_bytes" ]]; then
+        fout "$dom" "kopie is ${kopie_bytes} bytes, bron ${bron_bytes} bytes"
+        return 1
+    fi
+
+    if [[ "$CONTROLEER" == "ja" ]]; then
+        melding "$dom" "kopie nalopen met qemu-img check"
+        rc=0
+        qemu-img check -U "$tijdelijk" >/dev/null 2>&1 || rc=$?
+        case "$rc" in
+            0) : ;;
+            3) melding "$dom" "let op: qemu-img check meldt lekken in de kopie (niet fataal)" ;;
+            *) fout "$dom" "qemu-img check keurt de kopie af (exit ${rc})"; return 1 ;;
+        esac
+    fi
+
+    # Pas nu is het een backup: hernoemen en op schijf vastzetten.
+    mv -f -- "$tijdelijk" "$doelbestand" || { fout "$dom" "hernoemen mislukt"; return 1; }
+    trap - EXIT
+    sync -f -- "$doelbestand" 2>/dev/null || sync
+
+    manifest_schrijven "$dom" "$bodem" "$bundel" "$doelbestand" "$snapnaam" "$kopie_bytes" \
+        || { fout "$dom" "manifest schrijven mislukt"; return 1; }
+    leesmij_schrijven "$dom" "$bundel" "$(basename -- "$doelbestand")"
+
+    melding "$dom" "klaar: ${bundel} ($(numfmt --to=iec --suffix=B "$kopie_bytes" 2>/dev/null || echo "${kopie_bytes}B"))"
+    oude_pakketten_opruimen "$dom"
+    return 0
+}
+
+# Alles wat de restore nodig heeft en wat nergens anders staat opgeschreven.
+# Het blok "in de gast" is het belangrijkste: dat zit in de schijf en is
+# precies wat u op een andere host moet aanpassen.
+manifest_schrijven() {
+    local dom="$1" bodem="$2" bundel="$3" kopie="$4" snapnaam="$5" bytes="$6"
+    local xml="${bundel}/definitie/domein.xml" som="niet berekend"
+    local machine cpu geheugen vcpus virtueel gast_naam gast_ip moment
+
+    if [[ "$HASH" == "ja" ]]; then
+        melding "$dom" "sha256 van de kopie berekenen"
+        som="$(sha256sum -- "$kopie" 2>/dev/null | awk '{print $1}')"
+        [[ -n "$som" ]] || som="mislukt"
+    fi
+
+    machine="$(sed -n "s/.*machine='\([^']*\)'.*/\1/p" "$xml" | head -1)"
+    cpu="$(sed -n "s/.*<cpu mode='\([^']*\)'.*/\1/p" "$xml" | head -1)"
+    geheugen="$(sed -n "s/.*<memory unit='KiB'>\([0-9]*\)<.*/\1/p" "$xml" | head -1)"
+    vcpus="$(sed -n "s/.*<vcpu[^>]*>\([0-9]*\)<.*/\1/p" "$xml" | head -1)"
+    virtueel="$(qemu-img info -U "$kopie" 2>/dev/null \
+                | sed -n 's/^virtual size:.*(\([0-9]*\) bytes).*/\1/p' | head -1)"
+    gast_naam="$(virsh guestinfo "$dom" --hostname 2>/dev/null \
+                 | awk -F': *' '/hostname/{print $2; exit}')"
+    gast_ip="$(virsh domifaddr "$dom" --source agent 2>/dev/null \
+               | awk '$3=="ipv4" && $4 !~ /^127\./ {print $4}' | paste -sd, -)"
+    # het echte moment van de schijfinhoud: toen het snapshot viel. Via
+    # creationTime uit de XML en niet via de tekstuitvoer van snapshot-info,
+    # net als snapshot_created() in snapshot.sh - dat is taalonafhankelijk.
+    moment="$(virsh snapshot-dumpxml "$dom" "$snapnaam" 2>/dev/null \
+              | sed -n 's:.*<creationTime>\([0-9]*\)</creationTime>.*:\1:p')"
+    [[ -n "$moment" ]] && moment="$(date -d "@${moment}" +%Y-%m-%dT%H:%M:%S%:z)"
+
+    {
+        echo "# herstelpakket, zie HERSTEL.md in de repo makevm-2604"
+        echo "gast=${dom}"
+        echo "bronhost=$(hostname -f 2>/dev/null || hostname)"
+        echo "pakket_gemaakt=$(date +%Y-%m-%dT%H:%M:%S%:z)"
+        echo "schijf_moment=${moment:-onbekend}"
+        echo "snapshot=${snapnaam}"
+        echo "quiesce=ja"
+        echo "libvirt=$(virsh version 2>/dev/null | awk '/^Using library:/{print $4; exit}')"
+        echo "qemu=$(virsh version 2>/dev/null | awk '/^Running hypervisor:/{print $4; exit}')"
+        echo "machine=${machine:-onbekend}"
+        echo "cpu=${cpu:-onbekend}"
+        echo "geheugen_kib=${geheugen:-onbekend}"
+        echo "vcpus=${vcpus:-onbekend}"
+        echo "bron_pad=${bodem}"
+        echo "schijf=schijf/$(basename -- "$kopie")"
+        echo "schijf_bytes=${bytes}"
+        echo "schijf_virtueel_bytes=${virtueel:-onbekend}"
+        echo "schijf_sha256=${som}"
+        echo "# in de gast (zit in de schijf, moet elders mogelijk aangepast)"
+        echo "gast_hostname=${gast_naam:-onbekend}"
+        echo "gast_ip=${gast_ip:-onbekend}"
+    } > "${bundel}/manifest.txt" || return 1
+    chmod 0644 "${bundel}/manifest.txt" 2>/dev/null || true
+    return 0
+}
+
+# Wat iemand vindt die dit pakket over een jaar op een andere host uitpakt.
+leesmij_schrijven() {
+    local dom="$1" bundel="$2" schijfnaam="$3" netten
+    netten="$(cd "${bundel}/definitie" 2>/dev/null && ls netwerk-*.xml 2>/dev/null | paste -sd' ' -)"
+    cat > "${bundel}/LEESMIJ.txt" <<EOF
+Herstelpakket van ${dom}, gemaakt op $(date +%Y-%m-%d\ %H:%M) door bupvms.
+
+Inhoud
+    schijf/        de systeemschijf op het snapshotmoment (${schijfnaam})
+    definitie/     de machine (domein.xml) en de netwerken (${netten:-netwerk-*.xml})
+    manifest.txt   versies, hashes en de gegevens van binnen de gast
+    herstel.sh     zet dit pakket terug; HERSTEL.md legt uit waarom zo
+
+Snelste weg
+    sudo ./herstel.sh --droogloop .     # laat zien wat er zou gebeuren
+    sudo ./herstel.sh .                 # zelfde host, zelfde identiteit
+    sudo ./herstel.sh --naam ${dom}2 --nieuwe-identiteit --netwerk default .
+
+Terugzetten op een gelijksoortige host (Ubuntu, libvirt)
+    virsh net-define definitie/netwerk-NAAM.xml     # alleen als het ontbreekt
+    virsh net-start NAAM && virsh net-autostart NAAM
+    cp schijf/${schijfnaam} /var/lib/libvirt/images/
+    # pad in domein.xml naar de nieuwe plek wijzen, dan:
+    virsh define definitie/domein.xml
+    virsh start ${dom}
+
+Terugzetten op een vreemde host (andere distributie of qemu)
+    Neem de XML niet over maar voed virt-install uit manifest.txt:
+    virt-install --import --name ${dom} --memory GEHEUGEN --vcpus VCPUS \\
+      --disk /var/lib/libvirt/images/${schijfnaam},bus=virtio \\
+      --network network=default,model=virtio --graphics none --noautoconsole
+
+Let op
+    - machine=, cpu mode=host-passthrough en het emulator-pad zijn
+      hostgebonden; zie HERSTEL.md paragraaf 5 voor de aanpassingen.
+    - MAC en UUID botsen als het origineel nog draait; weglaten bij een kloon.
+    - Hostname, IP, machine-id en ssh-hostsleutels zitten IN de schijf. Voor
+      een kloon eerst: virt-sysprep -a schijf/${schijfnaam} \\
+        --operations machine-id,ssh-hostkeys,net-hostname
+EOF
+    chmod 0644 "${bundel}/LEESMIJ.txt" 2>/dev/null || true
+    return 0
+}
+
+# Alles boven BEWAAR weg, nieuwste eerst. Pas na een geslaagd pakket, zodat
+# een mislukte run nooit de laatste goede backup opeet.
+#
+# Het patroon is met opzet nauw: alleen mappen die dit script zelf maakt, dus
+# DOMEIN-JJJJMMDD-UUMMSS. In ${DOEL} staan ook kopieën van de hand
+# (isms.qcow2, base1-18.qcow2) en die blijven zo buiten schot.
+PAKKET_PATROON='-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]'
+oude_pakketten_opruimen() {
+    local dom="$1" n=0 regel pad
+    while IFS= read -r regel; do
+        pad="${regel#* }"
+        n=$(( n + 1 ))
+        (( n > BEWAAR )) || continue
+        # rm -rf verdient een gordel: alleen binnen ${DOEL} en alleen een naam
+        # die het patroon hierboven volgt.
+        case "$pad" in
+            "${DOEL}/${dom}-"*) : ;;
+            *) fout "$dom" "weiger op te ruimen: ${pad} ligt niet in ${DOEL}"; continue ;;
+        esac
+        rm -rf -- "$pad" && melding "$dom" "oud pakket verwijderd: ${pad}"
+    done < <(find "$DOEL" -maxdepth 1 -type d -name "${dom}${PAKKET_PATROON}" -printf '%T@ %p\n' 2>/dev/null | sort -rn)
+    return 0
+}
+
+########################################################################
+# EEN GAST
+########################################################################
+
+# De onderste laag van de keten: het echte image van de gast. Werkt zowel
+# vóór het snapshot (dan is de actieve schijf de bodem zelf) als erna.
+bodem_van() {
+    local dom="$1" actief
+    actief="$(virsh domblklist "$dom" --details 2>/dev/null \
+              | awk '$1=="file" && $2=="disk" {print $4; exit}')"
+    [[ -n "$actief" ]] || return 1
+    qemu-img info -U --backing-chain "$actief" 2>/dev/null \
+        | awk '/^image: /{laatste=substr($0,8)} END{print laatste}'
+}
+
+ruimte_genoeg() {
+    local dom="$1" bodem="$2" nodig vrij
+    nodig=$(( $(stat -c %s -- "$bodem") / 1073741824 + 1 + MARGE_GB ))
+    vrij="$(df -BG --output=avail "$DOEL" 2>/dev/null | tail -1 | tr -dc '0-9')"
+    if (( ${vrij:-0} < nodig )); then
+        fout "$dom" "${vrij:-0}G vrij op ${DOEL}, er is ongeveer ${nodig}G nodig"
+        return 1
+    fi
+    melding "$dom" "ruimte: ${vrij}G vrij op ${DOEL}, ${nodig}G nodig"
+    return 0
+}
+
+# Let op: deze functie wordt met "if ! doe_gast ..." aangeroepen en daarmee
+# staat errexit binnen de hele functie uit. Elke opdracht wordt hier dus met
+# de hand nagekeken.
+# De machine-instructies, vastgelegd terwijl de keten nog plat is. Tijdens
+# een open snapshot wijst de opgeslagen definitie naar de overlay met de
+# bodem als <backingStore>; die overlay bestaat straks niet meer.
+definitie_vastleggen() {
+    local dom="$1" bundel="$2" xml net nvram
+    xml="${bundel}/definitie/domein.xml"
+
+    mkdir -p "${bundel}/definitie" "${bundel}/schijf" || return 1
+    virsh dumpxml "$dom" --inactive > "$xml" 2>/dev/null || return 1
+    [[ -s "$xml" ]] || return 1
+
+    # elk netwerk waar de gast aan hangt; zonder deze definitie weigert de
+    # doelhost te starten met "Network not found"
+    while IFS= read -r net; do
+        [[ -n "$net" ]] || continue
+        if virsh net-dumpxml "$net" > "${bundel}/definitie/netwerk-${net}.xml" 2>/dev/null; then
+            melding "$dom" "netwerk ${net} vastgelegd"
+        else
+            rm -f -- "${bundel}/definitie/netwerk-${net}.xml"
+            melding "$dom" "let op: netwerk ${net} kon niet worden vastgelegd"
+        fi
+    done < <(sed -n "s/.*<source network='\\([^']*\\)'.*/\\1/p" "$xml" | sort -u)
+
+    # Het gereedschap hoort in het pakket: wie dit op een andere host uitpakt
+    # heeft de repo niet bij de hand.
+    local hulp
+    for hulp in herstel.sh HERSTEL.md; do
+        if [[ -r "${SCRIPT_DIR}/${hulp}" ]]; then
+            cp -- "${SCRIPT_DIR}/${hulp}" "${bundel}/${hulp}" || return 1
+        else
+            melding "$dom" "let op: ${hulp} niet gevonden, het pakket mist zijn gereedschap"
+        fi
+    done
+
+    # nvram alleen bij UEFI; deze gasten booten via SeaBIOS en hebben het niet
+    nvram="$(sed -n 's@.*<nvram[^>]*>\(.*\)</nvram>.*@\1@p' "$xml" | head -1)"
+    if [[ -n "$nvram" ]]; then
+        if [[ -r "$nvram" ]]; then
+            cp -- "$nvram" "${bundel}/definitie/nvram.fd" || return 1
+            melding "$dom" "nvram vastgelegd: ${nvram}"
+        else
+            fout "$dom" "de gast heeft nvram ${nvram} maar dat is niet leesbaar"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+doe_gast() {
+    local dom="$1" bodem naam bundel
+
+    if ! virsh dominfo "$dom" &>/dev/null; then
+        fout "$dom" "domein bestaat niet op deze host"
+        return 1
+    fi
+    if [[ "$(virsh domstate "$dom" 2>/dev/null | head -1)" != "running" ]]; then
+        fout "$dom" "draait niet; overgeslagen (een snapshot met --quiesce vereist een draaiende gast)"
+        return 1
+    fi
+    if ! bodem="$(bodem_van "$dom")" || [[ -z "$bodem" ]]; then
+        fout "$dom" "kan de bodem-image niet bepalen"
+        return 1
+    fi
+    ruimte_genoeg "$dom" "$bodem" || return 1
+
+    bundel="${DOEL}/${dom}-$(date +%Y%m%d-%H%M%S)"
+    if [[ -e "$bundel" ]]; then
+        fout "$dom" "${bundel} bestaat al"
+        return 1
+    fi
+    melding "$dom" "pakket ${bundel}"
+    if ! definitie_vastleggen "$dom" "$bundel"; then
+        fout "$dom" "kan de definities niet vastleggen; er is niets gekopieerd"
+        rm -rf -- "$bundel"
+        return 1
+    fi
+
+    naam="voor-backup-$(date +%Y%m%d-%H%M)"
+    melding "$dom" "snapshot '${naam}' maken; ${bodem} staat daarna stil"
+    if ! "$SNAPSHOT" -y -d "$dom" maken "$naam"; then
+        fout "$dom" "snapshot maken mislukt; er is niets gekopieerd"
+        rm -rf -- "$bundel"
+        return 1
+    fi
+    HUIDIG_DOM="$dom"; HUIDIG_SNAP="$naam"
+
+    # De kopie draait binnen "backup", dus met de grendel vast. Dit script
+    # roept zichzelf aan als payload; dat scheelt een berg aanhalingstekens.
+    local kopie_ok="ja"
+    if ! "$SNAPSHOT" -y -d "$dom" backup -- "$ZELF" --kopieer "$dom" "$bodem" "$bundel" "$naam"; then
+        fout "$dom" "de kopie is mislukt"
+        kopie_ok="nee"
+    fi
+
+    # Samenvoegen gebeurt hoe dan ook: de overlay is hier geen terugweg, alleen
+    # een manier om de bodem stil te houden tijdens het kopiëren.
+    melding "$dom" "snapshot '${naam}' samenvoegen"
+    if ! "$SNAPSHOT" -y -d "$dom" opruimen "$naam"; then
+        fout "$dom" "samenvoegen mislukt; doe met de hand: sudo ${SNAPSHOT} -d ${dom} opruimen ${naam}"
+        HUIDIG_SNAP=""      # de trap hoeft het niet nog eens te proberen
+        return 1
+    fi
+    HUIDIG_SNAP=""
+
+    # Een pakket zonder schijf is geen backup maar een valstrik voor later.
+    if [[ "$kopie_ok" != "ja" ]]; then
+        rm -rf -- "$bundel"
+        melding "$dom" "onvolledig pakket ${bundel} opgeruimd"
+        return 1
+    fi
+    return 0
+}
+
+########################################################################
+# AANROEP
+########################################################################
+
+# Payload-modus: hier komt "snapshot.sh backup" binnen.
+if [[ "${1:-}" == "--kopieer" ]]; then
+    [[ $# -eq 5 ]] || { echo "bupvms --kopieer DOMEIN BODEM PAKKET SNAPSHOT" >&2; exit 2; }
+    kopieer "$2" "$3" "$4" "$5"
+    exit $?
+fi
+
+case "${1:-}" in
+    -h|--help)
+        # het kopblok tot de eerste regel die geen commentaar is
+        awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$ZELF"
+        exit 0
+        ;;
+esac
+
+if [[ $EUID -ne 0 ]]; then
+    # Met een terminal erbij is sudo een kwestie van doorgeven; in cron (geen
+    # tty) is stilstaan wachten op een wachtwoord juist het laatste wat u wilt.
+    if [[ -t 0 ]]; then exec sudo -- "$ZELF" "$@"; fi
+    echo "bupvms: moet als root draaien (sudo ${ZELF})" >&2
+    exit 1
+fi
+
+[[ -x "$SNAPSHOT" ]] || { echo "bupvms: ${SNAPSHOT} ontbreekt of is niet uitvoerbaar" >&2; exit 1; }
+for hulp in virsh qemu-img flock find sort numfmt sha256sum paste; do
+    command -v "$hulp" >/dev/null || { echo "bupvms: ${hulp} ontbreekt" >&2; exit 1; }
+done
+[[ -d "$DOEL" ]] || { echo "bupvms: ${DOEL} bestaat niet" >&2; exit 1; }
+[[ -w "$DOEL" ]] || { echo "bupvms: ${DOEL} is niet beschrijfbaar" >&2; exit 1; }
+
+# Twee bupvms-runs door elkaar heen levert alleen maar geweigerde snapshots op.
+mkdir -p "$(dirname "$GRENDEL")" 2>/dev/null || true
+exec 8>>"$GRENDEL" || { echo "bupvms: kan ${GRENDEL} niet openen" >&2; exit 1; }
+if ! flock -n 8; then
+    echo "bupvms: er loopt al een backupronde ($(cat "$GRENDEL" 2>/dev/null | tr -d '\n'))" >&2
+    exit 1
+fi
+: >"$GRENDEL"; echo "pid=$$ gestart=$(date +%Y-%m-%dT%H:%M:%S%:z)" >>"$GRENDEL"
+
+trap 'opruimen_bij_afsluiten' EXIT
+trap 'melding "${HUIDIG_DOM:-alle}" "afgebroken (signaal)"; exit 130' INT TERM HUP
+
+DOMEINEN=( "$@" )
+if (( ${#DOMEINEN[@]} == 0 )); then
+    # Geen stilzwijgende lege ronde: dan denkt cron dat alles goed ging.
+    read -r -a DOMEINEN <<<"$ALL"
+fi
+if (( ${#DOMEINEN[@]} == 0 )); then
+    echo "bupvms: geen gasten opgegeven en ALL is leeg" >&2
+    echo "        gebruik: sudo $(basename "$ZELF") GAST [GAST ...]" >&2
+    echo "        of vul ALL bovenin ${ZELF}" >&2
+    exit 1
+fi
+
+melding alle "ronde begint voor: ${DOMEINEN[*]}"
+mislukt=()
+for d in "${DOMEINEN[@]}"; do
+    if ! doe_gast "$d"; then
+        mislukt+=( "$d" )
+    fi
+done
+
+if (( ${#mislukt[@]} > 0 )); then
+    melding alle "klaar, maar mislukt voor: ${mislukt[*]}"
+    exit 1
+fi
+melding alle "klaar; alle gasten gekopieerd naar ${DOEL}"
+exit 0

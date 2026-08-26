@@ -1,0 +1,452 @@
+#!/usr/bin/env php
+<?php
+/**
+ * bupdaily - de dagelijkse backup-run.
+ *
+ * Draait per gast, in deze volgorde:
+ *      ./cleanbup <gast>   ruimte vrijmaken, alleen ten koste van die gast
+ *      ./bupvms <gast>     de eigenlijke backup
+ *
+ * Per gast, niet een keer vooraf: cleanbup maakt plaats voor precies een
+ * backup (de grootste maal 1.5), en die ruimte is na de vorige gast weer
+ * opgesoupeerd.
+ *
+ * Een gast die faalt stopt de run niet: de rest wordt afgemaakt, de gast
+ * komt in het eindoverzicht en de exitcode is dan 1.
+ *
+ * Alle uitvoer (ook die van de aangeroepen scripts, ook stderr) gaat naar
+ * drie plaatsen tegelijk: het scherm, /var/log/bupdaily.log en een mail.
+ * De mail gaat altijd de deur uit, ook als het script halverwege struikelt.
+ *
+ * Gebruik:
+ *      sudo ./bupdaily isms lewi
+ *
+ * Voor cron: in de crontab van root (sudo crontab -e), want daar geldt de
+ * root-eis vanzelf. In een gebruikers-crontab stopt het script meteen met
+ * de melding dat het als root moet draaien.
+ *
+ *      17 3 * * *  /home/leo/claude/makevm-2604/bupdaily isms lewi >/dev/null 2>&1
+ *
+ * Die omleiding omdat alles al in /var/log/bupdaily.log en in de mail komt;
+ * anders probeert cron de uitvoer nog een keer te versturen, en een MTA is
+ * er op deze machine niet.
+ *
+ * Exitcode 0 = alles goed, anders 1.
+ *
+ * Verzenden gebeurt met PEAR Mail (pakket php-mail, met php-net-smtp).
+ * De mailinstellingen staan in /etc/bupdaily.conf; zie de kop van het blok
+ * INSTELLINGEN hieronder en bupdaily.conf.voorbeeld.
+ */
+
+declare(strict_types=1);
+
+// PEAR is oude code; de deprecation-meldingen van PHP 8 horen niet in de mail.
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_STRICT);
+ini_set('display_errors', 'stderr');
+
+require_once 'Mail.php';
+
+########################################################################
+# INSTELLINGEN
+#
+# De mailinstellingen staan in een apart configbestand, gezocht in deze
+# volgorde:
+#
+#       $BUPDAILY_CONF                  als die omgevingsvariabele gezet is
+#       /etc/bupdaily.conf
+#       <map van dit script>/bupdaily.conf
+#
+# Vorm: SLEUTEL=waarde, een regel per instelling. Lege regels en regels die
+# met # of ; beginnen worden overgeslagen, aanhalingstekens om de waarde
+# mogen. Zie bupdaily.conf.voorbeeld.
+#
+# Elke sleutel is te overschrijven met een omgevingsvariabele van dezelfde
+# naam; die wint van het configbestand.
+########################################################################
+
+const CONFIG_STANDAARD = '/etc/bupdaily.conf';
+
+$SCRIPT_MAP = dirname(realpath($argv[0]) ?: __FILE__);
+
+/**
+ * Stoppen voordat er gemaild kan worden: zonder deugdelijke instellingen is
+ * er geen mailweg, dus deze meldingen gaan alleen naar stderr en het log.
+ */
+function noodstop(string $melding): void
+{
+    $regel = '[bupdaily] FOUT: ' . $melding;
+    fwrite(STDERR, $regel . "\n");
+    @file_put_contents(
+        getenv('BUPDAILY_LOG') ?: '/var/log/bupdaily.log',
+        date('Y-m-d\TH:i:sP') . ' ' . $regel . "\n",
+        FILE_APPEND
+    );
+    exit(1);
+}
+
+function lees_config(string $pad): array
+{
+    $regels = @file($pad, FILE_IGNORE_NEW_LINES);
+    if ($regels === false) {
+        noodstop("kan configbestand $pad niet lezen");
+    }
+
+    $config = [];
+    foreach ($regels as $nr => $regel) {
+        $regel = trim($regel);
+        if ($regel === '' || $regel[0] === '#' || $regel[0] === ';') {
+            continue;
+        }
+        if (str_starts_with($regel, 'export ')) {      // een .env-regel mag ook
+            $regel = ltrim(substr($regel, 7));
+        }
+
+        $pos = strpos($regel, '=');
+        if ($pos === false) {
+            noodstop(sprintf('%s regel %d: geen SLEUTEL=waarde', $pad, $nr + 1));
+        }
+
+        $sleutel = trim(substr($regel, 0, $pos));
+        $waarde  = trim(substr($regel, $pos + 1));
+
+        $lengte = strlen($waarde);
+        if ($lengte >= 2
+            && ($waarde[0] === '"' || $waarde[0] === "'")
+            && $waarde[$lengte - 1] === $waarde[0]) {
+            $waarde = substr($waarde, 1, -1);
+        }
+
+        $config[$sleutel] = $waarde;
+    }
+
+    return $config;
+}
+
+$CONFIGPAD = getenv('BUPDAILY_CONF') ?: null;
+if ($CONFIGPAD === null) {
+    foreach ([CONFIG_STANDAARD, $SCRIPT_MAP . '/bupdaily.conf'] as $kandidaat) {
+        if (is_readable($kandidaat)) {
+            $CONFIGPAD = $kandidaat;
+            break;
+        }
+    }
+}
+if ($CONFIGPAD === null) {
+    noodstop('geen configbestand gevonden: ' . CONFIG_STANDAARD
+             . ' noch ' . $SCRIPT_MAP . '/bupdaily.conf');
+}
+
+$CONFIG = lees_config($CONFIGPAD);
+
+/**
+ * Instelling: omgevingsvariabele, anders configbestand, anders de
+ * standaardwaarde. Zonder standaardwaarde is de sleutel verplicht.
+ */
+function conf(string $naam, ?string $standaard = null): string
+{
+    global $CONFIG, $CONFIGPAD;
+
+    $waarde = getenv($naam);
+    if ($waarde === false || $waarde === '') {
+        $waarde = $CONFIG[$naam] ?? '';
+    }
+    if ($waarde === '') {
+        if ($standaard === null) {
+            noodstop("$naam ontbreekt in $CONFIGPAD");
+        }
+        return $standaard;
+    }
+
+    return $waarde;
+}
+
+define('LOGBESTAND', conf('BUPDAILY_LOG', '/var/log/bupdaily.log'));
+
+$MAIL = [
+    'host'     => conf('MAIL_HOST'),
+    'port'     => (int) conf('MAIL_PORT', '465'),
+    'username' => conf('MAIL_USERNAME'),
+    'password' => conf('MAIL_PASSWORD'),
+    'from'     => conf('MAIL_FROM_ADDRESS'),
+    'to'       => conf('MAIL_TO'),
+    'subject'  => conf('MAIL_SUBJECT', 'Rapport server backup'),
+];
+
+
+########################################################################
+# MELDINGEN: scherm + logbestand + mailbuffer
+########################################################################
+
+$RAPPORT   = '';        // wat er in de mail komt
+$LOGHANDLE = null;      // open logbestand, of null als dat niet lukte
+$GEMAILD   = false;     // voorkomt dubbele mail vanuit de shutdown-functie
+
+function logbestand()
+{
+    global $LOGHANDLE;
+    static $geprobeerd = false;
+
+    if (!$geprobeerd) {
+        $geprobeerd = true;
+        $LOGHANDLE  = @fopen(LOGBESTAND, 'a');
+        if ($LOGHANDLE === false) {
+            $LOGHANDLE = null;
+            fwrite(STDERR, sprintf("[bupdaily] WAARSCHUWING: kan %s niet schrijven\n", LOGBESTAND));
+        }
+    }
+    return $LOGHANDLE;
+}
+
+/** Een regel naar scherm, logbestand en mailbuffer. */
+function uit(string $regel): void
+{
+    global $RAPPORT;
+
+    $regel  = rtrim($regel, "\r\n") . "\n";
+    $RAPPORT .= $regel;
+
+    fwrite(STDOUT, $regel);
+
+    $fh = logbestand();
+    if ($fh !== null) {
+        fwrite($fh, date('Y-m-d\TH:i:sP') . ' ' . $regel);
+        fflush($fh);
+    }
+}
+
+function melding(string $regel): void { uit('[bupdaily] ' . $regel); }
+function fout(string $regel): void    { uit('[bupdaily] FOUT: ' . $regel); }
+
+########################################################################
+# EEN COMMANDO DRAAIEN, UITVOER MEE NAAR BOVEN
+#
+# stdout en stderr worden allebei gelezen en regel voor regel doorgegeven
+# aan uit(); de volgorde tussen de twee stromen kan daardoor iets schuiven,
+# maar niets gaat verloren.
+########################################################################
+
+function draai(array $commando): int
+{
+    $spec = [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+
+    $proces = @proc_open($commando, $spec, $pijpen);
+    if (!is_resource($proces)) {
+        fout('kan ' . implode(' ', $commando) . ' niet starten');
+        return 127;
+    }
+
+    stream_set_blocking($pijpen[1], false);
+    stream_set_blocking($pijpen[2], false);
+
+    $rest = [1 => '', 2 => ''];
+
+    while ($pijpen[1] !== null || $pijpen[2] !== null) {
+        $lezen = array_values(array_filter([$pijpen[1] ?? null, $pijpen[2] ?? null]));
+        if ($lezen === []) {
+            break;
+        }
+        $schrijven = $fout = null;
+        if (@stream_select($lezen, $schrijven, $fout, 1) === false) {
+            break;
+        }
+
+        foreach ([1, 2] as $nr) {
+            if ($pijpen[$nr] === null || !in_array($pijpen[$nr], $lezen, true)) {
+                continue;
+            }
+            $brok = fread($pijpen[$nr], 65536);
+            if ($brok === false || $brok === '') {
+                if (feof($pijpen[$nr])) {
+                    if ($rest[$nr] !== '') {
+                        uit($rest[$nr]);
+                        $rest[$nr] = '';
+                    }
+                    fclose($pijpen[$nr]);
+                    $pijpen[$nr] = null;
+                }
+                continue;
+            }
+            $rest[$nr] .= $brok;
+            while (($pos = strpos($rest[$nr], "\n")) !== false) {
+                uit(substr($rest[$nr], 0, $pos));
+                $rest[$nr] = substr($rest[$nr], $pos + 1);
+            }
+        }
+    }
+
+    return proc_close($proces);
+}
+
+########################################################################
+# VERZENDEN
+########################################################################
+
+function verzenden(bool $geslaagd): void
+{
+    global $MAIL, $RAPPORT, $GEMAILD;
+
+    if ($GEMAILD) {
+        return;
+    }
+    $GEMAILD = true;
+
+    $host = $MAIL['host'];
+    if ($MAIL['port'] === 465) {           // poort 465 = TLS vanaf de eerste byte
+        $host = 'ssl://' . $host;
+    }
+
+    $onderwerp = sprintf(
+        '%s - %s (%s)',
+        $MAIL['subject'],
+        $geslaagd ? 'GESLAAGD' : 'MISLUKT',
+        gethostname() ?: 'onbekend'
+    );
+
+    $kopregels = [
+        'From'                      => $MAIL['from'],
+        'To'                        => $MAIL['to'],
+        'Subject'                   => mb_encode_mimeheader($onderwerp, 'UTF-8'),
+        'Date'                      => date('r'),
+        'MIME-Version'              => '1.0',
+        'Content-Type'              => 'text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding' => 'base64',
+    ];
+
+    $verzender = Mail::factory('smtp', [
+        'host'     => $host,
+        'port'     => $MAIL['port'],
+        'auth'     => true,
+        'username' => $MAIL['username'],
+        'password' => $MAIL['password'],
+        'timeout'  => 30,
+    ]);
+
+    $resultaat = $verzender->send(
+        $MAIL['to'],
+        $kopregels,
+        rtrim(chunk_split(base64_encode($RAPPORT), 76, "\r\n"))
+    );
+
+    // Deze regel kan niet meer mee de mail in; wel het scherm en het log.
+    if (is_a($resultaat, 'PEAR_Error')) {
+        $regel = '[bupdaily] FOUT: mail versturen mislukt: ' . $resultaat->getMessage();
+    } else {
+        $regel = '[bupdaily] rapport gemaild naar ' . $MAIL['to'];
+    }
+    fwrite(STDOUT, $regel . "\n");
+    $fh = logbestand();
+    if ($fh !== null) {
+        fwrite($fh, date('Y-m-d\TH:i:sP') . ' ' . $regel . "\n");
+        fflush($fh);
+    }
+}
+
+function afsluiten(int $code): void
+{
+    verzenden($code === 0);
+    exit($code);
+}
+
+// Ook bij een fatale fout of een uitzondering gaat het rapport de deur uit.
+register_shutdown_function(static function (): void {
+    global $GEMAILD;
+    if ($GEMAILD) {
+        return;
+    }
+    $laatste = error_get_last();
+    if ($laatste !== null && ($laatste['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))) {
+        uit(sprintf('[bupdaily] FOUT: %s in %s regel %d',
+            $laatste['message'], $laatste['file'], $laatste['line']));
+    }
+    verzenden(false);
+});
+
+set_exception_handler(static function (Throwable $e): void {
+    fout(get_class($e) . ': ' . $e->getMessage());
+    afsluiten(1);
+});
+
+########################################################################
+# HET WERK
+########################################################################
+
+$gasten = array_slice($argv, 1);
+
+melding('gestart op ' . date('Y-m-d H:i:s'));
+
+if (posix_geteuid() !== 0) {
+    fout('dit script moet als root draaien (gebruik sudo)');
+    afsluiten(1);
+}
+
+if ($gasten === []) {
+    fout('geen gasten opgegeven');
+    uit('Gebruik: ' . basename($argv[0]) . ' <gast> [gast ...]');
+    afsluiten(1);
+}
+
+$map = $SCRIPT_MAP;
+if (!@chdir($map)) {
+    fout("kan niet naar $map gaan");
+    afsluiten(1);
+}
+
+melding('config  : ' . $CONFIGPAD);
+melding('werkmap : ' . $map);
+melding('gasten  : ' . implode(' ', $gasten));
+uit('');
+
+# ---------------------------------------------------------------- de ronde
+#
+# Opruimen en backuppen gaan per gast: cleanbup maakt ruimte voor een
+# backup, en die is na de vorige gast alweer opgebruikt.
+
+$geslaagd = [];
+$mislukt  = [];        // gast => reden
+
+foreach ($gasten as $gast) {
+    uit(str_repeat('=', 68));
+    melding("gast: $gast");
+    uit('');
+
+    melding("--- cleanbup ($gast) ---");
+    $rc = draai(['./cleanbup', $gast]);
+    uit('');
+    if ($rc !== 0) {
+        fout("cleanbup kon geen ruimte vrijmaken (exitcode $rc); $gast overgeslagen");
+        $mislukt[$gast] = "cleanbup exitcode $rc";
+        uit('');
+        continue;
+    }
+
+    melding("--- bupvms $gast ---");
+    $rc = draai(['./bupvms', $gast]);
+    uit('');
+    if ($rc !== 0) {
+        fout("bupvms is mislukt (exitcode $rc); $gast heeft geen verse backup");
+        $mislukt[$gast] = "bupvms exitcode $rc";
+        uit('');
+        continue;
+    }
+
+    $geslaagd[] = $gast;
+    melding("$gast klaar");
+    uit('');
+}
+
+# ------------------------------------------------------------- eindoverzicht
+uit(str_repeat('=', 68));
+melding('overzicht:');
+foreach ($gasten as $gast) {
+    uit(sprintf('    %-24s %s', $gast,
+        isset($mislukt[$gast]) ? 'MISLUKT - ' . $mislukt[$gast] : 'geslaagd'));
+}
+uit('');
+melding(sprintf('%d van de %d gasten geslaagd', count($geslaagd), count($gasten)));
+melding('klaar op ' . date('Y-m-d H:i:s'));
+
+afsluiten($mislukt === [] ? 0 : 1);

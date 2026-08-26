@@ -1,0 +1,10 @@
+logs/
+authorized_keys
+id_ed25519
+id_ed25519.pub
+nohup.out
+.claude/
+*.swp
+*.swo
+*~
+bupdaily.conf

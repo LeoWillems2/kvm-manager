@@ -1,0 +1,27 @@
+#
+# bupdaily.conf - instellingen voor het script bupdaily.
+#
+# Zet dit bestand neer als /etc/bupdaily.conf (of naast bupdaily zelf), met
+# alleen leesrecht voor root; er staat immers een wachtwoord in:
+#
+#       sudo install -o root -g root -m 600 bupdaily.conf.voorbeeld /etc/bupdaily.conf
+#       sudo nano /etc/bupdaily.conf
+#
+# Een andere plaats kan met de omgevingsvariabele BUPDAILY_CONF. Elke sleutel
+# hieronder is ook rechtstreeks als omgevingsvariabele te zetten; die wint dan
+# van dit bestand.
+#
+
+# --- mailserver ------------------------------------------------------------
+MAIL_HOST=smtp.transip.email
+MAIL_PORT=465                      # 465 = TLS vanaf de eerste byte (ssl://)
+MAIL_USERNAME=info@voorbeeld.nl
+MAIL_PASSWORD="het-wachtwoord-hier"
+
+# --- afzender en ontvanger -------------------------------------------------
+MAIL_FROM_ADDRESS=noreply@voorbeeld.nl
+MAIL_TO=beheerder@voorbeeld.nl
+MAIL_SUBJECT="Rapport server backup"
+
+# --- overig ----------------------------------------------------------------
+# BUPDAILY_LOG=/var/log/bupdaily.log
