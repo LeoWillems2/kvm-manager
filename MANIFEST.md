@@ -28,9 +28,23 @@ snapshot hooguit crash-consistent. Voordat het base-image valt draait
 `beveilig.sh` in de gast, zodat elke kloon dat erft. Kan ook opruimen (`-r`)
 en hernoemen (`-m`). Elke stap meldt zich machineleesbaar in `logs/`.
 
+De instellingen (netwerk, hardware, paden, pakketten) staan in deel 1 van het
+script, maar horen daar niet vast te zitten: een `makevm.config` gaat er
+overheen en de opdrachtregel gaat weer over de config heen, zodat een nieuwe
+versie van het script uw eigen inrichting niet overschrijft. Met
+`--dump-config` leest het script een bestaande gast uit — de definitie bij
+libvirt en, via de qemu-guest-agent, tijdzone, toetsenbord, beheerder,
+firewallregel en de met de hand geïnstalleerde pakketten — en schrijft het
+daar zo'n configbestand van. Daarmee is een nieuwe gast te bouwen zoals een
+bestaande. Het resultaat is een vertrekpunt, geen kopie: achter elke regel
+staat waar de waarde vandaan komt, en `EXTRA_PACKAGES` en `IP_MODE` zijn
+afgeleid, niet gemeten.
+
     sudo ./makevm.sh -n naam -i ip [-d GB] [-b base] [--iso x] [-y]
     sudo ./makevm.sh -r NAAM            # gast en boekhouding opruimen
     sudo ./makevm.sh -m OUD NIEUW       # hernoemen
+    sudo ./makevm.sh --dump-config josefina > makevm-josefina.config
+    sudo ./makevm.sh -c makevm-josefina.config -n nieuwe -i 192.168.100.40
 
 ### `beveilig.sh`
 Zet de beveiligingsmaatregelen op een Ubuntu-server: apt dist-upgrade,
@@ -109,6 +123,7 @@ detail — *uitwijk* (dezelfde machine elders, alles identiek, origineel uit) of
 
 | bestand | inhoud |
 |---|---|
+| `makevm.config.voorbeeld` | model voor `makevm.config`: alle instellingen van `makevm.sh` met uitleg. De echte configbestanden (`makevm.config`, `makevm-{naam}.config`) staan niet in git — ze horen bij deze host en er kan een wachtwoordhash in staan |
 | `bupdaily.conf.voorbeeld` | model voor `/etc/bupdaily.conf` (mailserver, afzender, ontvanger). Het echte bestand staat buiten deze map, root-only, want er staat een wachtwoord in |
 | `authorized_keys` | publieke sleutels die in elke nieuwe gast terechtkomen (niet in git) |
 | `id_ed25519` | sleutelpaar waarmee de host bij de gasten kan; de publieke helft gaat mee de gast in (niet in git) |
@@ -121,7 +136,8 @@ Meelezen met een lopende run:
 
 ## Waar het spul staat
 
-Als je andere paden gebruikt dan hieronder moet je de parameters voorin elk script aanpassen.
+Als je andere paden gebruikt dan hieronder moet je de parameters voorin elk
+script aanpassen — voor `makevm.sh` kan dat ook in `makevm.config`.
 
 | pad | wat |
 |---|---|
@@ -129,6 +145,7 @@ Als je andere paden gebruikt dan hieronder moet je de parameters voorin elk scri
 | `/t/kvm-ss/` | de overlays van openstaande snapshots |
 | `/t2/kvm-bup/{naam}-JJJJMMDD-UUMMSS/` | de herstelpakketten |
 | `/run/lock/` | de grendels van `snapshot.sh` en `bupvms` |
+| `/etc/makevm.conf` | instellingen voor `makevm.sh` voor de hele host (optioneel); `./makevm.config` en `./makevm-{naam}.config` gaan daar overheen |
 | `/etc/bupdaily.conf` | mailinstellingen voor `bupdaily` (root, 600) |
 | `/var/log/bupdaily.log` | het log van de dagelijkse ronde |
 | `./authorized_keys` | ssh authorized keys |

@@ -1,0 +1,113 @@
+#
+# makevm.config - instellingen voor het script makevm.sh.
+#
+# Alles wat in deel 1 van makevm.sh staat is hier te zetten, zodat u het
+# script zelf niet hoeft aan te passen en een nieuwe versie ervan uw eigen
+# inrichting niet overschrijft. De volgorde is:
+#
+#       makevm.sh  <  dit bestand  <  de opdrachtregel
+#
+# Zet dit bestand neer naast makevm.sh, met alleen leesrecht voor uzelf; er
+# kan een wachtwoordhash in staan:
+#
+#       cp makevm.config.voorbeeld makevm.config
+#       chmod 600 makevm.config
+#       nano makevm.config
+#
+# Welke bestanden makevm.sh leest, als ze bestaan en in deze volgorde (later
+# wint):
+#
+#       /etc/makevm.conf                    voor de hele host
+#       {map van makevm.sh}/makevm.config   voor deze werkkopie
+#       {map van makevm.sh}/makevm-{naam}.config   voor die ene VM
+#
+# Met -c BESTAND of de omgevingsvariabele MAKEVM_CONF wijst u een bestand
+# aan; dan wordt alleen dat gelezen.
+#
+# De vorm is sleutel=waarde, een per regel. # is commentaar, ook achter een
+# waarde. De waarde gaat niet door de shell heen: ${POOL_DIR} blijft
+# letterlijk staan en $(...) wordt niet uitgevoerd. Aanhalingstekens om de
+# waarde zijn nodig zodra er een spatie of een # in staat.
+#
+# Elke regel mag weg. Wat u weglaat blijft staan op de waarde uit makevm.sh.
+#
+# Naam en adres van de VM staan er bewust niet in: die komen altijd van -n en
+# -i, zodat een run zonder argumenten nooit ongevraagd een VM bouwt. Ook
+# ASSUME_YES (-y) kan hier niet: "geen vragen stellen" hoort een bewuste
+# handeling op de opdrachtregel te zijn.
+#
+# Dit bestand hoeft u niet met de hand te schrijven. Van een VM die al draait
+# maakt makevm.sh er zelf een:
+#
+#       sudo ./makevm.sh --dump-config josefina > makevm-josefina.config
+#       chmod 600 makevm-josefina.config
+#
+# en daarmee bouwt u een nieuwe VM zoals die ene:
+#
+#       sudo ./makevm.sh -c makevm-josefina.config -n nieuwe -i 192.168.100.40
+#
+
+# --- netwerk ---------------------------------------------------------------
+LIBVIRT_NET=tthomlw
+NETMASK_PREFIX=24
+GATEWAY=192.168.100.1
+DNS_SERVERS=192.168.100.1,1.1.1.1
+SEARCH_DOMAIN=tthomlw
+
+# Hoe krijgt de VM zijn adres?
+#   static      = vast IP in de guest, libvirt weet van niets
+#   reservation = guest doet DHCP, libvirt/dnsmasq geeft MAC -> IP vast uit
+#   both        = vast IP in de guest EN een reservering in libvirt (voor DNS)
+IP_MODE=static
+
+# --- hardware --------------------------------------------------------------
+VCPUS=2
+RAM_MB=4096
+DISK_GB=10                         # minimaal 10; overschrijf met -d GB
+MACHINE=q35
+CPU_MODEL="host-passthrough,check=none,migratable=on"
+OS_VARIANT=ubuntu25.10             # moet in de lokale osinfo-db staan
+GRAPHICS="spice,listen=127.0.0.1"
+VIDEO=virtio
+
+# --- opslag en paden -------------------------------------------------------
+POOL_DIR=/t/kvm                    # de map van de libvirt-pool
+# ISO_DIR=/t/kvm/iso               # leeg laten = ${POOL_DIR}/iso
+ISO=ubuntu-26.04-live-server-amd64.iso
+# BASE_NAME=                       # leeg = {naam}-base.qcow2; of NAAM of PAD
+
+# lvm = ext4 op LVM (Ubuntu-standaard), direct = een enkele ext4 root
+STORAGE_LAYOUT=lvm
+LVM_SIZING=all                     # all = root vult de VG, scaled = subiquity
+
+# --- account en ssh-sleutels -----------------------------------------------
+ADMIN_USER=leo
+# De wachtwoordhash van die gebruiker (openssl passwd -6). Leeg laten laat
+# makevm.sh erom vragen bij een volledige installatie. Staat hier iets, dan
+# hoort dit bestand op chmod 600.
+# ADMIN_PWHASH=
+
+# Waar de publieke sleutels vandaan komen. Leeg laten = de map van makevm.sh.
+# SSH_KEY_DIR=
+# SSH_AUTH_KEYS_FILE=              # leeg = ${SSH_KEY_DIR}/authorized_keys
+# SSH_PRIVKEY_FILE=                # leeg = ${SSH_KEY_DIR}/id_ed25519
+
+# --- beveiliging en firewall -----------------------------------------------
+HARDEN=yes                         # beveilig.sh in de nieuwe VM draaien
+# HARDEN_SCRIPT=                   # leeg = beveilig.sh naast makevm.sh
+SSH_ALLOW_FROM=any                 # of: "192.168.100.0/24 10.8.0.5"
+
+# --- installatiekeuzes -----------------------------------------------------
+TIMEZONE=Europe/Amsterdam
+LOCALE=en_US.UTF-8
+KEYBOARD_LAYOUT=us
+EXTRA_PACKAGES=qemu-guest-agent    # naast openssh-server, fail2ban en ufw
+AUTOSTART=yes                      # VM meestarten met de host
+SSH_WAIT_SECS=900                  # hoe lang wachten tot de VM ssh accepteert
+MANAGE_KNOWN_HOSTS=yes             # known_hosts van root en de sudo-gebruiker
+
+# --- logging ---------------------------------------------------------------
+# LOG_DIR=                         # leeg = logs/ naast makevm.sh
+# LOG_FILE=                        # leeg = automatisch; "-" = niet loggen
+# STATUS_FILE=                     # leeg = ${LOG_DIR}/makevm-{naam}.status
+HEARTBEAT_SECS=60                  # hoe vaak een WAIT-regel bij lang wachten

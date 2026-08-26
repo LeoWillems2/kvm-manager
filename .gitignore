@@ -8,3 +8,9 @@ nohup.out
 *.swo
 *~
 bupdaily.conf
+
+# Configbestanden van makevm.sh: die horen bij deze ene host (paden, netwerk)
+# en kunnen een wachtwoordhash bevatten - ook de bestanden die
+# "makevm.sh --dump-config NAAM" oplevert. makevm.config.voorbeeld eindigt op
+# .voorbeeld en valt er niet onder; die blijft wel in git.
+makevm*.config

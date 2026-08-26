@@ -40,15 +40,32 @@
 # het scherm en in een logbestand, zodat te volgen is waar een run staat en
 # waarom hij eventueel niet is afgemaakt.
 #
+# De instellingen in deel 1 zijn de standaardwaarden. Wie ze wil aanpassen
+# hoeft dit script niet te wijzigen: een configbestand (makevm.config) gaat
+# er overheen, en de opdrachtregel gaat weer over het configbestand heen.
+# Zie deel 3A. Met --dump-config leest het script een bestaande VM uit en
+# schrijft het zo'n configbestand, zodat een nieuwe VM als een bestaande
+# gebouwd kan worden.
+#
 # Gebruik:  sudo ./makevm.sh -n naam -i ip [-d GB] [-b base] [--iso x] [-y]
 #           sudo ./makevm.sh -r NAAM            # VM en boekhouding opruimen
 #           sudo ./makevm.sh -m OUD NIEUW       # VM en boekhouding hernoemen
+#           sudo ./makevm.sh --dump-config NAAM > makevm-naam.config
 #
 set -Eeuo pipefail
 
 ########################################################################
-# 1. DEFINITIE - pas hier aan
+# 1. DEFINITIE - de standaardwaarden
 ########################################################################
+#
+# Hiermee begint het script. Alles in dit deel is te overschrijven zonder
+# dit bestand aan te raken:
+#
+#     deel 1 hieronder  <  configbestand  <  opdrachtregel
+#
+# Deel 3A zegt welke configbestanden gelezen worden en hoe ze eruitzien;
+# makevm.config.voorbeeld staat naast dit script. Met --dump-config NAAM
+# schrijft dit script zo'n bestand voor u, uitgelezen uit een bestaande VM.
 
 # Naam en adres komen altijd van de opdrachtregel (-n en -i); deze twee
 # waarden zijn alleen een voorbeeld van de vorm die verwacht wordt.
@@ -80,9 +97,12 @@ GRAPHICS="spice,listen=127.0.0.1"
 VIDEO="virtio"
 
 # --- opslag / paden ---
+# Een pad dat van een ander pad afhangt staat hier leeg; deel 3C rekent het
+# uit nadat het configbestand gelezen is. Zet u alleen POOL_DIR in de config,
+# dan verhuist ISO_DIR vanzelf mee - vult u ISO_DIR ook in, dan wint dat.
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 POOL_DIR="/t/kvm"                 # libvirt-pool "kvm"
-ISO_DIR="${POOL_DIR}/iso"         # hier staan de install-ISO's
+ISO_DIR=""                        # leeg => ${POOL_DIR}/iso (de install-ISO's)
 BASE_NAME=""                      # leeg => {Hostname}-base.qcow2; of -b NAAM|PAD
 
 # Schijfindeling bij een volledige installatie:
@@ -94,15 +114,15 @@ LVM_SIZING="all"
 # --- account en ssh-sleutels op de nieuwe VM ---
 ADMIN_USER="leo"
 ADMIN_PWHASH=""                   # leeg => script vraagt erom bij een full build
-SSH_KEY_DIR="${SCRIPT_DIR}"
-SSH_AUTH_KEYS_FILE="${SSH_KEY_DIR}/authorized_keys"
-SSH_PRIVKEY_FILE="${SSH_KEY_DIR}/id_ed25519"
+SSH_KEY_DIR=""                    # leeg => de map van dit script
+SSH_AUTH_KEYS_FILE=""             # leeg => ${SSH_KEY_DIR}/authorized_keys
+SSH_PRIVKEY_FILE=""               # leeg => ${SSH_KEY_DIR}/id_ed25519
 
 # --- beveiliging ---
 # Los script met alle maatregelen (blok A). makevm.sh zet het in de gast neer
 # en draait het daar; zo staat alles op een plek en kunt u het ook los op een
 # bestaande host draaien.
-HARDEN_SCRIPT="${SCRIPT_DIR}/beveilig.sh"
+HARDEN_SCRIPT=""                  # leeg => ${SCRIPT_DIR}/beveilig.sh
 HARDEN="yes"                      # met --no-harden overslaan
 
 # --- firewall ---
@@ -123,7 +143,8 @@ SSH_WAIT_SECS="900"                # hoe lang wachten tot de VM ssh accepteert
 MANAGE_KNOWN_HOSTS="yes"
 
 # --- logging en bewaking ---
-LOG_DIR="${SCRIPT_DIR}/logs"      # hierin komen het log- en het statusbestand
+LOG_DIR=""                        # leeg => ${SCRIPT_DIR}/logs; hierin komen
+                                  # het log- en het statusbestand
 LOG_FILE=""                       # leeg => ${LOG_DIR}/makevm-{naam}-{tijd}.log
                                   # "-"  => niet naar bestand loggen
 STATUS_FILE=""                    # leeg => ${LOG_DIR}/makevm-{naam}.status
@@ -222,7 +243,9 @@ event() {
     esac
     # op het scherm blijft een detailregel kort; het log krijgt de hele regel
     if [[ "$status" == "INFO" ]]; then screen="==> ${msg}"; else screen="$line"; fi
-    if [[ "$status" == "FAIL" || "$status" == "WARN" ]]; then
+    # Onder --dump-config gaat alles naar stderr: stdout is daar het
+    # configbestand en mag niets anders bevatten.
+    if [[ "$status" == "FAIL" || "$status" == "WARN" || "${DUMP_MODE:-no}" == "yes" ]]; then
         printf '\033[%sm%s\033[0m\n' "$color" "$screen" >&2
     else
         printf '\033[%sm%s\033[0m\n' "$color" "$screen"
@@ -384,6 +407,158 @@ confirm() {
     [[ "$answer" =~ ^([jJ]|[yY])$ ]]
 }
 
+
+########################################################################
+# 3A. HET CONFIGBESTAND
+########################################################################
+#
+# De waarden uit deel 1 zijn het vertrekpunt, niet de wet:
+#
+#     deel 1 van dit script  <  configbestand  <  opdrachtregel
+#
+# Zo blijft makevm.sh los bruikbaar zonder configbestand, en overleeft uw
+# eigen inrichting (POOL_DIR, LIBVIRT_NET, ADMIN_USER) een nieuwe versie van
+# dit script.
+#
+# Welke bestanden gelezen worden:
+#
+#   -c/--config BESTAND   alleen dat bestand (idem $MAKEVM_CONF); bestaat het
+#                         niet, dan stopt het script - u vroeg er expliciet om
+#   anders, in deze volgorde en alleen als ze bestaan (later wint):
+#       /etc/makevm.conf                          voor de hele host
+#       {map van dit script}/makevm.config        voor deze werkkopie
+#       {map van dit script}/makevm-{naam}.config voor die ene VM
+#
+# De vorm is sleutel=waarde, een per regel; # is commentaar, ook achter een
+# waarde tussen aanhalingstekens. De waarde gaat niet door de shell heen:
+# ${POOL_DIR} blijft letterlijk staan en $(...) wordt niet uitgevoerd. Een
+# pad dat van een ander pad afhangt laat u weg; deel 3C rekent het dan uit.
+#
+# Naam en adres van de VM staan er bewust niet in. Die komen altijd van -n en
+# -i, zodat een run zonder argumenten nooit ongevraagd een VM kan bouwen -
+# dezelfde reden waarom dit script zonder argumenten niets doet.
+# --dump-config schrijft ze wel mee, als commentaar.
+
+# Wat een configbestand mag zetten. Wat hier niet in staat is geen instelling
+# maar boekhouding van een lopende run, en levert een foutmelding op.
+CONFIG_KEYS="
+ISO LIBVIRT_NET NETMASK_PREFIX GATEWAY DNS_SERVERS SEARCH_DOMAIN IP_MODE
+VCPUS RAM_MB DISK_GB MACHINE CPU_MODEL OS_VARIANT GRAPHICS VIDEO
+POOL_DIR ISO_DIR BASE_NAME STORAGE_LAYOUT LVM_SIZING
+ADMIN_USER ADMIN_PWHASH SSH_KEY_DIR SSH_AUTH_KEYS_FILE SSH_PRIVKEY_FILE
+HARDEN HARDEN_SCRIPT SSH_ALLOW_FROM
+TIMEZONE LOCALE KEYBOARD_LAYOUT EXTRA_PACKAGES AUTOSTART SSH_WAIT_SECS
+MANAGE_KNOWN_HOSTS LOG_DIR LOG_FILE STATUS_FILE HEARTBEAT_SECS
+"
+# ASSUME_YES ontbreekt daar expres. "Geen vragen stellen" hoort een bewuste
+# handeling op de opdrachtregel te zijn (-y); een vergeten regel in een
+# configbestand mag niet stilzwijgend het opruimen van een VM goedkeuren.
+
+CONFIG_FILE=""            # -c/--config of $MAKEVM_CONF; leeg = zelf zoeken
+CONFIG_LOADED=""          # welke bestanden gelezen zijn, voor in het logboek
+PRESCAN_NAME=""           # de VM-naam van de opdrachtregel, voor makevm-{naam}.config
+
+config_key_known() {
+    local k
+    for k in $CONFIG_KEYS; do
+        [[ "$k" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+config_read_file() {
+    local f="$1" nr=0 line trimmed key val rest q
+    [[ -r "$f" ]] || die "Configbestand ${f} is niet te lezen."
+    # Dit script draait als root en HARDEN_SCRIPT is het pad naar een script
+    # dat het in de gast uitvoert; een configbestand dat iedereen mag
+    # aanpassen is daarmee een achterdeur.
+    [[ -n "$(find "$f" -maxdepth 0 -perm -o+w 2>/dev/null)" ]] && \
+        die "Configbestand ${f} is door iedereen te wijzigen; herstel met: chmod o-w ${f}"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        nr=$(( nr + 1 ))
+        line="${line%$'\r'}"                          # bestanden met CRLF
+        trimmed="${line#"${line%%[![:space:]]*}"}"    # spaties aan het begin weg
+        [[ -z "$trimmed" || "$trimmed" == '#'* ]] && continue
+
+        [[ "$trimmed" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || \
+            die "${f} regel ${nr}: geen sleutel=waarde en geen commentaar: ${trimmed}"
+        key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+        val="${val#"${val%%[![:space:]]*}"}"          # spaties voor de waarde weg
+
+        if [[ "$val" == '"'* || "$val" == "'"* ]]; then
+            # Tussen aanhalingstekens: alles tot het sluitteken is de waarde,
+            # daarachter mag alleen nog commentaar staan.
+            q="${val:0:1}"; rest="${val:1}"
+            [[ "$rest" == *"$q"* ]] || die "${f} regel ${nr}: aanhalingsteken niet gesloten."
+            val="${rest%%"$q"*}"
+            rest="${rest#*"$q"}"
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+            [[ -z "$rest" || "$rest" == '#'* ]] || \
+                die "${f} regel ${nr}: onverwachte tekst achter de waarde: ${rest}"
+        else
+            val="${val%%[[:space:]]#*}"               # commentaar achter de waarde
+            val="${val%"${val##*[![:space:]]}"}"      # spaties aan het eind weg
+        fi
+
+        config_key_known "$key" || \
+            die "${f} regel ${nr}: '${key}' is geen instelling van makevm.sh; zie makevm.config.voorbeeld."
+        printf -v "$key" '%s' "$val"
+    done <"$f"
+
+    CONFIG_LOADED+="${CONFIG_LOADED:+,}${f}"
+    return 0
+}
+
+config_load() {
+    local f
+    if [[ -n "$CONFIG_FILE" ]]; then
+        [[ -f "$CONFIG_FILE" ]] || die "Configbestand ${CONFIG_FILE} bestaat niet."
+        config_read_file "$CONFIG_FILE"
+        return 0
+    fi
+    for f in /etc/makevm.conf "${SCRIPT_DIR}/makevm.config" \
+             ${PRESCAN_NAME:+"${SCRIPT_DIR}/makevm-${PRESCAN_NAME}.config"}; do
+        [[ -f "$f" ]] && config_read_file "$f"
+    done
+    return 0
+}
+
+# Alleen het configbestand en de VM-naam opzoeken. Dit gebeurt voor de echte
+# optieverwerking, want het configbestand moet gelezen zijn voordat de
+# opdrachtregel er overheen mag gaan - en welk bestand dat is, hangt van de
+# naam af. Hier wordt niets afgekeurd; dat doet de lus verderop.
+config_prescan() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--config)
+                [[ -n "${2:-}" ]] && CONFIG_FILE="$2" ;;
+            -n|--name|-r|--remove|-m|--move|--dump-config)
+                [[ -n "${2:-}" && "${2:-}" != -* ]] && PRESCAN_NAME="$2" ;;
+        esac
+        shift
+    done
+    return 0
+}
+
+########################################################################
+# 3C. PADEN DIE VAN ANDERE INSTELLINGEN AFHANGEN
+########################################################################
+#
+# Pas hier, na het configbestand: anders zou ISO_DIR nog naar de POOL_DIR uit
+# deel 1 wijzen terwijl de config een andere pool aanwijst. Wat al gevuld is
+# blijft staan, dus wie ISO_DIR zelf invult houdt zijn eigen pad.
+
+config_derive_paths() {
+    : "${ISO_DIR:=${POOL_DIR}/iso}"
+    : "${SSH_KEY_DIR:=${SCRIPT_DIR}}"
+    : "${SSH_AUTH_KEYS_FILE:=${SSH_KEY_DIR}/authorized_keys}"
+    : "${SSH_PRIVKEY_FILE:=${SSH_KEY_DIR}/id_ed25519}"
+    : "${HARDEN_SCRIPT:=${SCRIPT_DIR}/beveilig.sh}"
+    : "${LOG_DIR:=${SCRIPT_DIR}/logs}"
+    return 0
+}
+
 usage() {
     cat <<EOF
 Gebruik: $(basename "$0") -n NAAM -i ADRES [opties]
@@ -393,6 +568,8 @@ Gebruik: $(basename "$0") -n NAAM -i ADRES [opties]
   -d, --disk-size GB   grootte van de systeemschijf in GiB (standaard: ${DISK_GB})
   -b, --base NAAM|PAD  base-image om uit te klonen (standaard: {naam}-base.qcow2)
       --iso BESTAND    install-ISO in ${ISO_DIR} (standaard: ${ISO})
+  -c, --config BEST.   instellingen uit dit bestand lezen in plaats van uit de
+                       bestanden die het script zelf zoekt (zie onderaan)
       --no-base        geen base-image aanmaken/gebruiken, altijd volledig installeren
       --rebuild-base   bestaand base-image weggooien en opnieuw opbouwen uit een
                        volledige installatie (in plaats van eruit klonen)
@@ -412,14 +589,29 @@ Beheren in plaats van bouwen (deze twee bouwen niets):
   -m, --move OUD NIEUW VM hernoemen: qcow2, pad in de XML, domeinnaam en
                        autostart. De gast houdt binnenin zijn eigen hostname
                        en zijn IP-adres; die blijven ongemoeid.
-  Let op: met -y worden ook hier alle vragen met ja beantwoord, ook die over
-  het weggooien of hernoemen van {naam}-base.qcow2.
+  Let op: met -y worden bij -r en -m alle vragen met ja beantwoord, ook die
+  over het weggooien of hernoemen van {naam}-base.qcow2.
+
+      --dump-config NAAM
+                       een bestaande VM uitlezen en de instellingen als
+                       configbestand naar stdout schrijven; verandert niets en
+                       vraagt niets. Draait de VM en antwoordt de
+                       qemu-guest-agent, dan komen ook tijdzone, toetsenbord,
+                       beheerder en de met de hand geinstalleerde pakketten mee.
+                         sudo $(basename "$0") --dump-config josefina > makevm-josefina.config
+                         sudo $(basename "$0") -c makevm-josefina.config -n nieuwe -i 192.168.100.40
 
 Meelezen tijdens een run:
   tail -f ${LOG_DIR}/makevm-{naam}-laatste.log
   cat     ${LOG_DIR}/makevm-{naam}.status
 
-Overige instellingen staan als variabelen bovenaan het script.
+Instellingen:
+  Alles uit deel 1 van dit script is te zetten in een configbestand, zodat u
+  het script zelf niet hoeft te wijzigen. Volgorde: script < config < opties.
+  Gelezen worden, als ze bestaan: /etc/makevm.conf, ${SCRIPT_DIR}/makevm.config
+  en ${SCRIPT_DIR}/makevm-{naam}.config - of alleen het bestand achter -c.
+  Nu geladen: ${CONFIG_LOADED:-geen}
+  Zie makevm.config.voorbeeld voor de vorm en de volledige lijst.
 EOF
 }
 
@@ -427,10 +619,19 @@ USE_BASE="yes"
 REBUILD_BASE="no"
 REMOVE_MODE="no"                  # -r: opruimen in plaats van bouwen
 MOVE_TO=""                        # -m: nieuwe naam; leeg = niet hernoemen
-MANAGE_MODE="no"                  # -r of -m: deze run bouwt niets
+DUMP_MODE="no"                    # --dump-config: alleen uitlezen, niets doen
+MANAGE_MODE="no"                  # -r, -m of --dump-config: deze run bouwt niets
 NAME_GIVEN="no"                   # is -n meegegeven? (verplicht bij bouwen)
 IP_GIVEN="no"                     # is -i meegegeven? (verplicht bij bouwen)
 DISK_GIVEN="no"                   # is -d meegegeven? (alleen voor de melding)
+
+# Eerst de config, dan pas de opdrachtregel: die moet er overheen kunnen.
+# De voorloop haalt alleen -c en de VM-naam uit de argumenten; de lus verderop
+# doet de echte verwerking en de controles.
+CONFIG_FILE="${MAKEVM_CONF:-}"
+config_prescan "$@"
+config_load
+config_derive_paths
 
 # Zonder argumenten niets doen. De waarden bovenaan dit script zijn een
 # vertrekpunt, geen opdracht: wie hier per ongeluk op enter drukt, zou anders
@@ -438,7 +639,7 @@ DISK_GIVEN="no"                   # is -d meegegeven? (alleen voor de melding)
 # aangeboden krijgen om op te ruimen.
 if [[ $# -eq 0 ]]; then
     usage >&2
-    die "Geef op zijn minst -n NAAM en -i ADRES mee (of -r NAAM / -m OUD NIEUW); zonder argumenten doet dit script niets."
+    die "Geef op zijn minst -n NAAM en -i ADRES mee (of -r NAAM / -m OUD NIEUW / --dump-config NAAM); zonder argumenten doet dit script niets."
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -448,6 +649,9 @@ while [[ $# -gt 0 ]]; do
         -i|--ip)        IPaddress="${2:-}"; IP_GIVEN="yes"; shift 2 ;;
         -b|--base)      BASE_NAME="${2:-}"; shift 2 ;;
         --iso)          ISO="${2:-}"; shift 2 ;;
+        # -c is hierboven al toegepast; hier alleen nog nagekeken en overgeslagen
+        -c|--config)    [[ -n "${2:-}" ]] || { usage >&2; die "-c/--config heeft een bestandsnaam nodig."; }
+                        shift 2 ;;
         --no-base)      USE_BASE="no"; shift ;;
         --rebuild-base) REBUILD_BASE="yes"; shift ;;
         -r|--remove)    [[ -n "${2:-}" && "${2:-}" != -* ]] || { usage >&2; die "-r/--remove heeft een naam nodig: -r NAAM."; }
@@ -455,6 +659,8 @@ while [[ $# -gt 0 ]]; do
         -m|--move)      [[ -n "${2:-}" && "${2:-}" != -* && -n "${3:-}" && "${3:-}" != -* ]] \
                             || { usage >&2; die "-m/--move heeft twee namen nodig: -m OUD NIEUW."; }
                         Hostname="$2"; MOVE_TO="$3"; shift 3 ;;
+        --dump-config)  [[ -n "${2:-}" && "${2:-}" != -* ]] || { usage >&2; die "--dump-config heeft een naam nodig: --dump-config NAAM."; }
+                        DUMP_MODE="yes"; Hostname="$2"; shift 2 ;;
         --no-harden)    HARDEN="no"; shift ;;
         --no-known-hosts) MANAGE_KNOWN_HOSTS="no"; shift ;;
         --log)          LOG_FILE="${2:-}"; shift 2 ;;
@@ -467,6 +673,13 @@ done
 
 [[ "$USE_BASE" == "no" && "$REBUILD_BASE" == "yes" ]] && \
     die "--no-base en --rebuild-base gaan niet samen: de eerste maakt geen base-image, de tweede juist een nieuwe."
+
+# --dump-config leest alleen; het verandert niets aan de VM of de boekhouding
+if [[ "$DUMP_MODE" == "yes" ]]; then
+    MANAGE_MODE="yes"
+    [[ "$REMOVE_MODE" == "yes" || -n "$MOVE_TO" ]] && \
+        die "--dump-config gaat niet samen met -r of -m: het leest alleen uit, het verandert niets."
+fi
 
 # -r en -m zijn beheermodi: die bouwen niets, dus bouwopties horen er niet bij
 if [[ "$REMOVE_MODE" == "yes" || -n "$MOVE_TO" ]]; then
@@ -642,7 +855,10 @@ wait_for_shutoff() {
 # script 197632 bytes waar 45G bedoeld was. De gewone uitvoer zet het
 # aantal bytes tussen haakjes achter de leesbare maat.
 image_virtual_bytes() {
-    qemu-img info "$1" 2>/dev/null \
+    # -U: ook lezen als een draaiende VM de schijf in handen heeft. De
+    # virtuele grootte staat in de qcow2-kop en verandert niet tijdens
+    # gebruik; zonder -U weigert qemu-img het bestand te openen.
+    qemu-img info -U "$1" 2>/dev/null \
         | sed -n 's/^virtual size: .*(\([0-9]\+\) bytes).*/\1/p' | head -1
 }
 
@@ -1019,12 +1235,453 @@ EOF
 }
 
 ########################################################################
+# 4C. EEN BESTAANDE VM UITLEZEN (--dump-config)
+########################################################################
+#
+# Leest wat libvirt en de gast zelf over een bestaande VM weten en schrijft
+# dat als configbestand naar stdout:
+#
+#   sudo ./makevm.sh --dump-config josefina > makevm-josefina.config
+#   sudo ./makevm.sh -c makevm-josefina.config -n nieuwe -i 192.168.100.40
+#
+# Het resultaat is een vertrekpunt, geen kopie. Achter elke regel staat waar
+# de waarde vandaan komt - libvirt, de gast, of de standaard uit deel 1 -
+# zodat te zien is wat er gelezen en wat er geraden is. Lees het na voordat u
+# ermee bouwt; EXTRA_PACKAGES is de grootste schatting (zie daar).
+#
+# Wat uit de gast komt, komt via de qemu-guest-agent. Staat de VM uit of
+# antwoordt de agent niet, dan blijven die regels als commentaar staan met de
+# standaardwaarde erin: het bestand is dan nog bruikbaar, alleen minder
+# compleet.
+#
+# Deze modus staat voor deel 5: hij bouwt niets en heeft de preflight van een
+# bouwrun (vrije ruimte, sleutels, seed) dus niet nodig. Alle meldingen gaan
+# naar stderr - zie event() in deel 2 - zodat stdout niets anders bevat dan
+# het configbestand.
+
+# --- commando's in de draaiende gast uitvoeren -------------------------
+# Via de qemu-guest-agent (draait als root), omdat er op deze host geen
+# libguestfs staat en sudo in de gast een wachtwoord vraagt.
+guest_agent_ready() {
+    local i
+    for i in $(seq "${1:-30}"); do
+        virsh qemu-agent-command "$Hostname" '{"execute":"guest-ping"}' >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# guest_exec SCRIPT [AANTAL_POLLS]
+# Wacht standaard 60 x 2s; een lange klus (apt-upgrade) geeft meer mee.
+# Na afloop staan de exitcode en de uitvoer in GUEST_EXITCODE/GUEST_OUTPUT,
+# zodat de aanroeper onderscheid kan maken tussen "mislukt" en "klaar met
+# waarschuwingen", en de uitvoer in het logboek van deze run kan zetten.
+GUEST_EXITCODE=""
+GUEST_OUTPUT=""
+guest_exec() {
+    local script="$1" polls="${2:-60}" b64 pid res i out
+    GUEST_EXITCODE=""; GUEST_OUTPUT=""
+    b64="$(printf '%s' "$script" | base64 -w0)"
+    pid="$(virsh qemu-agent-command "$Hostname" \
+        "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/sh\",\"arg\":[\"-c\",\"echo ${b64} | base64 -d | sh\"],\"capture-output\":true}}" \
+        2>/dev/null | sed -n 's/.*"pid":\([0-9]\{1,\}\).*/\1/p')"
+    [[ -n "$pid" ]] || return 1
+    res=""
+    for (( i = 0; i < polls; i++ )); do
+        res="$(virsh qemu-agent-command "$Hostname" \
+            "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${pid}}}" 2>/dev/null)"
+        [[ "$res" == *'"exited":true'* ]] && break
+        sleep 2
+    done
+    [[ "$res" == *'"exited":true'* ]] || return 124      # nog bezig: opgegeven
+    GUEST_EXITCODE="$(sed -n 's/.*"exitcode":\([0-9]\{1,\}\).*/\1/p' <<<"$res" | head -1)"
+    out="$(sed -n 's/.*"out-data":"\([^"]*\)".*/\1/p' <<<"$res" | head -1)"
+    [[ -n "$out" ]] && GUEST_OUTPUT="$(base64 -d <<<"$out" 2>/dev/null || true)"
+    [[ "${GUEST_EXITCODE:-1}" == "0" ]]
+}
+
+# Meldingen van deze modus: naar stderr, want stdout is het configbestand.
+dump_note() { printf '%s\n' "$*" >&2; }
+
+# dump_line SLEUTEL WAARDE HERKOMST
+# Een lege waarde levert een uitgecommentarieerde regel op met de standaard
+# uit deel 1 erin: er is dan niets gevonden en de gebruiker moet zelf kiezen.
+dump_line() {
+    local key="$1" val="$2" bron="$3" q='"' pre="" left
+    if [[ -z "$val" ]]; then
+        pre="# "; val="${!key-}"; bron="NIET GEVONDEN - standaard van makevm.sh"
+    fi
+    [[ "$val" == *'"'* ]] && q="'"
+    printf -v left '%s%s=%s%s%s' "$pre" "$key" "$q" "$val" "$q"
+    printf '%-46s # %s\n' "$left" "$bron"
+}
+
+# Een sleutel uit de uitvoer van de gastprobe hieronder
+DUMP_GUEST_INFO=""
+dump_guest() { sed -n "s/^${1}=//p" <<<"$DUMP_GUEST_INFO" | head -1; }
+
+# Alles wat alleen de gast zelf weet, in een keer opgehaald: elke guest-exec
+# is een aparte ronde langs de agent, dus dit script schrijft daar
+# sleutel=waarde-regels en de host pluist ze hier uit.
+dump_guest_probe() {
+    local probe
+    read -r -d '' probe <<'EOS' || true
+set -u
+p() { printf '%s=%s\n' "$1" "$2"; }
+
+p HOSTNAME "$(hostname 2>/dev/null)"
+p CIDR     "$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4; exit}')"
+p GATEWAY  "$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+
+# Volgorde niet sorteren: de eerste resolver is de eerste resolver.
+dns=$(resolvectl dns 2>/dev/null | tr ' ' '\n' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | awk '!gezien[$0]++' | paste -sd, -)
+[ -z "$dns" ] && dns=$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | paste -sd, -)
+p DNS "$dns"
+p SEARCH "$(awk '/^search/{print $2; exit}' /etc/resolv.conf 2>/dev/null)"
+
+p TIMEZONE "$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null)"
+p LOCALE   "$(awk -F= '/^LANG=/{gsub(/"/,"",$2); print $2; exit}' /etc/default/locale 2>/dev/null)"
+p KEYBOARD "$(awk -F= '/^XKBLAYOUT=/{gsub(/"/,"",$2); print $2; exit}' /etc/default/keyboard 2>/dev/null)"
+
+osv=""
+if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    osv="${ID:-}${VERSION_ID:-}"
+fi
+p OSVARIANT "$osv"
+
+# ext4 op LVM of een enkele partitie? Het roottype van lsblk zegt het.
+root=$(findmnt -no SOURCE / 2>/dev/null)
+if [ "$(lsblk -no TYPE "$root" 2>/dev/null | head -1)" = "lvm" ]; then
+    p STORAGE lvm
+else
+    p STORAGE direct
+fi
+
+if grep -rqs 'dhcp4:[[:space:]]*\(true\|yes\)' /etc/netplan 2>/dev/null; then
+    p DHCP4 ja
+else
+    p DHCP4 nee
+fi
+
+# De beheerder: de eerste echte gebruiker die mag sudoen.
+admin=""
+for g in sudo admin; do
+    for u in $(getent group "$g" 2>/dev/null | cut -d: -f4 | tr ',' ' '); do
+        uid=$(id -u "$u" 2>/dev/null) || continue
+        [ "$uid" -ge 1000 ] && [ "$uid" -lt 65534 ] || continue
+        admin="$u"
+        break
+    done
+    [ -n "$admin" ] && break
+done
+[ -z "$admin" ] && admin=$(awk -F: '$3>=1000 && $3<65534 {print $1; exit}' /etc/passwd 2>/dev/null)
+p ADMIN "$admin"
+
+# Alleen een echte hash meenemen; ! of * betekent "geen wachtwoord".
+hash=$(awk -F: -v u="$admin" '$1==u{print $2}' /etc/shadow 2>/dev/null)
+case "$hash" in
+    '$'*) p PWHASH "$hash" ;;
+    *)    p PWHASH "" ;;
+esac
+
+# ufw zet de bron achter de actie: "OpenSSH  LIMIT  Anywhere". beveilig.sh
+# gebruikt LIMIT in plaats van ALLOW, dus beide tellen mee. De (v6)-regels
+# zijn dezelfde regels en zouden alles verdubbelen.
+allow=$(ufw status 2>/dev/null | awk '
+    $0 !~ /\(v6\)/ && $1 ~ /^(22|22\/tcp|OpenSSH)$/ {
+        for (i = 1; i <= NF; i++)
+            if ($i == "ALLOW" || $i == "LIMIT") {
+                bron = ""
+                for (j = i + 1; j <= NF; j++) bron = bron (bron ? " " : "") $j
+                print bron
+            }
+    }' | sort -u | paste -sd' ' -)
+[ "$allow" = "Anywhere" ] && allow="any"
+p SSHFROM "$allow"
+
+# Met de hand geinstalleerde pakketten, min wat elke Ubuntu-server en elke VM
+# van dit script toch al heeft: makevm zet openssh-server, fail2ban, ufw en
+# cloud-init neer, beveilig.sh de rest van de lijst hieronder.
+basis=$(mktemp 2>/dev/null) || basis="/tmp/.makevm-basis.$$"
+cat >"$basis" <<'EOB'
+ubuntu-server
+ubuntu-server-minimal
+ubuntu-standard
+ubuntu-minimal
+ubuntu-advantage-tools
+ubuntu-pro-client
+linux-generic
+linux-virtual
+lvm2
+cryptsetup
+cryptsetup-initramfs
+netplan.io
+cloud-init
+snapd
+sudo
+openssh-server
+fail2ban
+ufw
+unattended-upgrades
+apt-listchanges
+needrestart
+apparmor
+apparmor-utils
+auditd
+audispd-plugins
+EOB
+kandidaat=$(apt-mark showmanual 2>/dev/null | sort -u \
+            | grep -vxF -f "$basis" \
+            | grep -Ev '^(linux-(image|headers|modules|tools)|grub-|shim|language-pack-)')
+
+# Wat overblijft moet nog door een van twee zeven komen.
+#
+# Zeef 1 - prioriteit optional of extra. Een enkele "apt --reinstall" van het
+# grondsysteem zet honderden pakketten op manual, en dat zijn juist de
+# pakketten met prioriteit required, important of standard.
+prio=$(mktemp 2>/dev/null) || prio="/tmp/.makevm-prio.$$"
+dpkg-query -W -f='${Package} ${Priority}\n' 2>/dev/null \
+    | awk '$2 == "optional" || $2 == "extra" {print $1}' | sort -u >"$prio"
+
+# Zeef 2 - het pakket is ooit met "apt install" genoemd. Dat vangt wat zeef 1
+# laat vallen omdat het prioriteit important of standard heeft (net-tools
+# bijvoorbeeld) maar hier wel degelijk een keuze was.
+hist=$(mktemp 2>/dev/null) || hist="/tmp/.makevm-hist.$$"
+zcat -f /var/log/apt/history.log* 2>/dev/null \
+    | sed -n 's/^Commandline: .*apt[a-z-]* install //p' \
+    | grep -v -- '--reinstall' | tr ' ' '\n' \
+    | grep -v '^-' | sed 's/:.*//' | grep -v '^$' | sort -u >"$hist"
+
+pkgs=$( { printf '%s\n' "$kandidaat" | grep -xF -f "$prio"
+          printf '%s\n' "$kandidaat" | grep -xF -f "$hist"
+        } | grep -v '^$' | sort -u | paste -sd' ' -)
+rm -f "$basis" "$prio" "$hist"
+p PAKKETTEN "$pkgs"
+
+# Ter controle: wat er sinds de installatie met de hand is bijgezet.
+# --reinstall valt af: dat is onderhoud, geen keuze over wat erop hoort.
+p APTHISTORIE "$(zcat -f /var/log/apt/history.log* 2>/dev/null \
+    | sed -n 's/^Commandline: .*apt[a-z-]* install //p' \
+    | grep -v -- '--reinstall' | tail -10 | cut -c1-110 | paste -sd'; ' -)"
+EOS
+    guest_exec "$probe" 60
+}
+
+dump_config() {
+    local xml netxml mac state
+    local d_vcpus d_ram d_disk d_machine d_cpu d_graphics d_video d_net
+    local d_diskpath d_pool d_autostart d_osvariant d_isomode
+    local g_cidr g_ip g_prefix g_admin g_pwhash g_pkgs g_hist
+    local mem_kib bytes cpu_line gfx_line vid_block
+
+    [[ ${EUID} -eq 0 ]] || die "Draai dit als root: sudo $0 --dump-config ${Hostname}"
+    command -v virsh    >/dev/null || die "Commando 'virsh' ontbreekt."
+    command -v qemu-img >/dev/null || die "Commando 'qemu-img' ontbreekt."
+    virsh dominfo "$Hostname" &>/dev/null || \
+        die "Er is geen VM '${Hostname}' op deze host; kijk met: virsh list --all"
+    xml="$(virsh dumpxml "$Hostname" 2>/dev/null)" || \
+        die "Kan de definitie van '${Hostname}' niet lezen."
+
+    # --- wat libvirt weet --------------------------------------------
+    d_vcpus="$(sed -n "s/.*<vcpu[^>]*>\([0-9]*\)<.*/\1/p" <<<"$xml" | head -1)"
+    mem_kib="$(sed -n "s/.*<memory unit='KiB'>\([0-9]*\)<.*/\1/p" <<<"$xml" | head -1)"
+    d_ram=""; [[ "$mem_kib" =~ ^[0-9]+$ ]] && d_ram=$(( mem_kib / 1024 ))
+
+    # machine='pc-q35-9.0' -> q35; het script wil de korte vorm
+    case "$(sed -n "s/.*<type[^>]*machine='\([^']*\)'.*/\1/p" <<<"$xml" | head -1)" in
+        *q35*) d_machine="q35" ;;
+        "")    d_machine=""    ;;
+        *)     d_machine="pc"  ;;
+    esac
+
+    d_cpu=""
+    cpu_line="$(grep -m1 '<cpu ' <<<"$xml" || true)"
+    if [[ -n "$cpu_line" ]]; then
+        d_cpu="$(sed -n "s/.*mode='\([^']*\)'.*/\1/p" <<<"$cpu_line")"
+        [[ -n "$d_cpu" ]] || d_cpu="custom"
+        local c_check c_migr
+        c_check="$(sed -n "s/.*check='\([^']*\)'.*/\1/p" <<<"$cpu_line")"
+        c_migr="$(sed -n "s/.*migratable='\([^']*\)'.*/\1/p" <<<"$cpu_line")"
+        [[ -n "$c_check" ]] && d_cpu+=",check=${c_check}"
+        [[ -n "$c_migr"  ]] && d_cpu+=",migratable=${c_migr}"
+    fi
+
+    d_graphics=""
+    gfx_line="$(grep -m1 '<graphics ' <<<"$xml" || true)"
+    if [[ -n "$gfx_line" ]]; then
+        d_graphics="$(sed -n "s/.*<graphics type='\([^']*\)'.*/\1/p" <<<"$gfx_line")"
+        local g_listen
+        g_listen="$(sed -n "s/.*listen='\([^']*\)'.*/\1/p" <<<"$gfx_line")"
+        [[ -n "$d_graphics" && -n "$g_listen" ]] && d_graphics+=",listen=${g_listen}"
+    fi
+
+    vid_block="$(awk "/<video>/,/<\/video>/" <<<"$xml" || true)"
+    d_video="$(sed -n "s/.*<model type='\([^']*\)'.*/\1/p" <<<"$vid_block" | head -1)"
+
+    d_net="$(sed -n "s/.*<source network='\([^']*\)'.*/\1/p" <<<"$xml" | head -1)"
+    mac="$(sed -n "s/.*<mac address='\([^']*\)'.*/\1/p" <<<"$xml" | head -1)"
+
+    # De eerste qcow2 is de systeemschijf; de seed is een .iso en valt af.
+    d_diskpath="$(sed -n "s/.*<source file='\([^']*\.qcow2\)'.*/\1/p" <<<"$xml" | head -1)"
+    d_pool=""; d_disk=""
+    if [[ -n "$d_diskpath" ]]; then
+        d_pool="$(dirname "$d_diskpath")"
+        bytes="$(image_virtual_bytes "$d_diskpath" 2>/dev/null || true)"
+        [[ "$bytes" =~ ^[0-9]+$ ]] && d_disk=$(( (bytes + 1024**3 - 1) / 1024**3 ))
+    fi
+
+    case "$(virsh dominfo "$Hostname" 2>/dev/null | awk -F: '/^Autostart/{gsub(/ /,"",$2); print $2}')" in
+        enable)  d_autostart="yes" ;;
+        disable) d_autostart="no"  ;;
+        *)       d_autostart=""    ;;
+    esac
+
+    # libosinfo:os id="http://ubuntu.com/ubuntu/25.10" -> ubuntu25.10
+    d_osvariant="$(sed -n "s|.*libosinfo:os id=\"http://[^/]*/\([^/]*\)/\([^\"]*\)\".*|\1\2|p" <<<"$xml" | head -1)"
+
+    # --- wat de gast weet --------------------------------------------
+    state="$(virsh domstate "$Hostname" 2>/dev/null | head -1)"
+    if [[ "$state" == "running" ]] && guest_agent_ready 3; then
+        if dump_guest_probe; then
+            DUMP_GUEST_INFO="$GUEST_OUTPUT"
+        else
+            dump_note "let op: de gast antwoordde niet op de uitvraag; alleen libvirt-gegevens."
+        fi
+    else
+        dump_note "let op: VM '${Hostname}' is ${state:-onbekend} of de qemu-guest-agent antwoordt niet."
+        dump_note "      Tijdzone, locale, toetsenbord, beheerder en pakketten blijven daarom leeg."
+    fi
+
+    g_cidr="$(dump_guest CIDR)"
+    g_ip="${g_cidr%%/*}"
+    g_prefix=""; [[ "$g_cidr" == */* ]] && g_prefix="${g_cidr##*/}"
+    g_admin="$(dump_guest ADMIN)"
+    g_pwhash="$(dump_guest PWHASH)"
+    g_pkgs="$(dump_guest PAKKETTEN)"
+    g_hist="$(dump_guest APTHISTORIE)"
+    [[ -n "$d_osvariant" ]] || d_osvariant="$(dump_guest OSVARIANT)"
+
+    # static, reservation of both? Dat volgt uit twee dingen: doet de gast
+    # DHCP, en staat er een vaste toewijzing voor zijn MAC in het netwerk.
+    d_isomode=""
+    if [[ -n "$d_net" ]]; then
+        local res="nee" dhcp
+        netxml="$(virsh net-dumpxml "$d_net" 2>/dev/null || true)"
+        [[ -n "$mac" ]] && grep -qi "mac='${mac}'" <<<"$netxml" && res="ja"
+        dhcp="$(dump_guest DHCP4)"
+        case "${dhcp}/${res}" in
+            nee/nee) d_isomode="static"      ;;
+            nee/ja)  d_isomode="both"        ;;
+            ja/ja)   d_isomode="reservation" ;;
+            ja/nee)  dump_note "let op: de gast doet DHCP zonder reservering in ${d_net}; IP_MODE niet in te vullen." ;;
+        esac
+    fi
+
+    # --- schrijven ----------------------------------------------------
+    cat <<EOF
+# Uitgelezen uit de VM '${Hostname}' op $(_ts)
+#   met: makevm.sh --dump-config ${Hostname}
+#
+# Zo gebruikt u dit bestand:
+#   sudo ./makevm.sh -c makevm-${Hostname}.config -n NIEUWE-NAAM -i NIEUW-ADRES
+# of hernoem het naar makevm.config (voor elke VM) of makevm-{naam}.config
+# (voor die ene VM); dan vindt makevm.sh het zelf.
+#
+# LEES DIT NA VOORDAT U ERMEE BOUWT. Achter elke regel staat waar de waarde
+# vandaan komt. Een regel die met # begint is niet gevonden; daarachter staat
+# de standaard van makevm.sh, zodat u ziet wat er anders zou gebeuren.
+#
+# Naam en adres horen hier niet in: die komen altijd van -n en -i. Van deze VM
+# waren ze:
+#   -n ${Hostname} -i ${g_ip:-onbekend}
+EOF
+
+    printf '\n# --- netwerk ---\n'
+    dump_line LIBVIRT_NET     "$d_net"       "libvirt"
+    dump_line NETMASK_PREFIX  "$g_prefix"    "gast (${g_cidr:-geen adres gevonden})"
+    dump_line GATEWAY         "$(dump_guest GATEWAY)"  "gast (default route)"
+    dump_line DNS_SERVERS     "$(dump_guest DNS)"      "gast (resolv.conf)"
+    dump_line SEARCH_DOMAIN   "$(dump_guest SEARCH)"   "gast (resolv.conf)"
+    dump_line IP_MODE         "$d_isomode"   "gast (netplan) + libvirt (reservering)"
+
+    printf '\n# --- hardware ---\n'
+    dump_line VCPUS           "$d_vcpus"     "libvirt"
+    dump_line RAM_MB          "$d_ram"       "libvirt"
+    dump_line DISK_GB         "$d_disk"      "qemu-img (${d_diskpath:-geen schijf gevonden})"
+    dump_line MACHINE         "$d_machine"   "libvirt"
+    dump_line CPU_MODEL       "$d_cpu"       "libvirt"
+    dump_line OS_VARIANT      "$d_osvariant" "libvirt-metadata of /etc/os-release"
+    dump_line GRAPHICS        "$d_graphics"  "libvirt"
+    dump_line VIDEO           "$d_video"     "libvirt"
+
+    printf '\n# --- opslag ---\n'
+    dump_line POOL_DIR        "$d_pool"      "libvirt (map van de systeemschijf)"
+    dump_line STORAGE_LAYOUT  "$(dump_guest STORAGE)" "gast (lsblk op /)"
+
+    printf '\n# --- installatiekeuzes ---\n'
+    dump_line TIMEZONE        "$(dump_guest TIMEZONE)" "gast (timedatectl)"
+    dump_line LOCALE          "$(dump_guest LOCALE)"   "gast (/etc/default/locale)"
+    dump_line KEYBOARD_LAYOUT "$(dump_guest KEYBOARD)" "gast (/etc/default/keyboard)"
+    dump_line AUTOSTART       "$d_autostart" "libvirt"
+
+    printf '\n# --- account ---\n'
+    dump_line ADMIN_USER      "$g_admin"     "gast (eerste sudoer met uid >= 1000)"
+    if [[ -n "$g_pwhash" ]]; then
+        printf '# De wachtwoordhash van %s, zodat een nieuwe VM hetzelfde wachtwoord\n' "$g_admin"
+        printf '# krijgt. Laat de regel weg als u een ander wachtwoord wilt; makevm.sh\n'
+        printf '# vraagt er dan om. LET OP: hierdoor is dit bestand geheim (chmod 600).\n'
+        dump_line ADMIN_PWHASH "$g_pwhash"   "gast (/etc/shadow)"
+    else
+        printf '# Geen bruikbare wachtwoordhash gevonden (geen wachtwoord, of gast niet\n'
+        printf '# gelezen). Leeg laten betekent: makevm.sh vraagt er zelf om.\n'
+        dump_line ADMIN_PWHASH "" "gast (/etc/shadow)"
+    fi
+
+    printf '\n# --- firewall ---\n'
+    dump_line SSH_ALLOW_FROM  "$(dump_guest SSHFROM)" "gast (ufw status, regel 22/tcp)"
+
+    printf '\n# --- pakketten ---\n'
+    printf '# SCHATTING. Dit is de lijst met de hand geinstalleerde pakketten\n'
+    printf '# (apt-mark showmanual), min de pakketten die elke Ubuntu-server en elke\n'
+    printf '# VM van dit script toch al krijgt, en daarna alleen wat prioriteit\n'
+    printf '# optional of extra heeft of ooit met "apt install" genoemd is. Zonder die\n'
+    printf '# zeven vult een enkele apt --reinstall de lijst met het hele grondsysteem.\n'
+    printf '# Er kan dus iets ontbreken dat als afhankelijkheid binnenkwam, en er kan\n'
+    printf '# iets in staan dat de installer meenam in plaats van u. Loop de lijst na\n'
+    printf '# voordat u ermee bouwt; de apt-geschiedenis hieronder helpt daarbij.\n'
+    dump_line EXTRA_PACKAGES  "$g_pkgs" "gast (apt-mark + apt-geschiedenis)"
+    if [[ -n "$g_hist" ]]; then
+        printf '#\n# Ter controle - de laatste apt install-opdrachten uit de geschiedenis\n'
+        printf '# van de gast (/var/log/apt/history.log):\n'
+        printf '#   %s\n' "${g_hist//; /$'\n#   '}"
+    fi
+
+    printf '\n# --- beveiliging ---\n'
+    printf '# Uit de gast niet af te lezen: of beveilig.sh gedraaid heeft. Deze VM is\n'
+    printf '# gehard als de sysctl- en sshd-instellingen van beveilig.sh erin staan.\n'
+    dump_line HARDEN "yes" "standaard van makevm.sh, niet gemeten"
+
+    dump_note "Configbestand van '${Hostname}' geschreven naar stdout."
+    [[ -n "$g_pwhash" ]] && dump_note "Er staat een wachtwoordhash in: chmod 600 op het bestand waar u dit heen schrijft."
+    dump_note "Lees het na: EXTRA_PACKAGES en IP_MODE zijn afgeleid, niet gemeten."
+    return 0
+}
+
+if [[ "$DUMP_MODE" == "yes" ]]; then
+    dump_config
+    exit 0
+fi
+
+########################################################################
 # 5. PREFLIGHT
 ########################################################################
 
 init_logging
 event START run "makevm gestart voor '${Hostname}' (${IPaddress}), schijf ${DISK_GB}G" \
     "pid=$$" "gebruiker=${SUDO_USER:-${USER:-root}}" \
+    "config=${CONFIG_LOADED:-geen}" \
     "log=${LOG_FILE:-geen}" "status=${STATUS_FILE:-geen}"
 if [[ -n "${LOG_FILE:-}" ]]; then
     printf '    meelezen : tail -f %s\n    stand    : cat %s\n\n' \
@@ -1288,47 +1945,6 @@ target_write_cmds() {
     printf '    - mkdir -p /target%s\n' "$(dirname "$path")"
     printf '    - echo %s | base64 -d > /target%s\n' "$b64" "$path"
     printf '    - chmod %s /target%s\n' "$mode" "$path"
-}
-
-# --- commando's in de draaiende gast uitvoeren -------------------------
-# Via de qemu-guest-agent (draait als root), omdat er op deze host geen
-# libguestfs staat en sudo in de gast een wachtwoord vraagt.
-guest_agent_ready() {
-    local i
-    for i in $(seq "${1:-30}"); do
-        virsh qemu-agent-command "$Hostname" '{"execute":"guest-ping"}' >/dev/null 2>&1 && return 0
-        sleep 2
-    done
-    return 1
-}
-
-# guest_exec SCRIPT [AANTAL_POLLS]
-# Wacht standaard 60 x 2s; een lange klus (apt-upgrade) geeft meer mee.
-# Na afloop staan de exitcode en de uitvoer in GUEST_EXITCODE/GUEST_OUTPUT,
-# zodat de aanroeper onderscheid kan maken tussen "mislukt" en "klaar met
-# waarschuwingen", en de uitvoer in het logboek van deze run kan zetten.
-GUEST_EXITCODE=""
-GUEST_OUTPUT=""
-guest_exec() {
-    local script="$1" polls="${2:-60}" b64 pid res i out
-    GUEST_EXITCODE=""; GUEST_OUTPUT=""
-    b64="$(printf '%s' "$script" | base64 -w0)"
-    pid="$(virsh qemu-agent-command "$Hostname" \
-        "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/sh\",\"arg\":[\"-c\",\"echo ${b64} | base64 -d | sh\"],\"capture-output\":true}}" \
-        2>/dev/null | sed -n 's/.*"pid":\([0-9]\{1,\}\).*/\1/p')"
-    [[ -n "$pid" ]] || return 1
-    res=""
-    for (( i = 0; i < polls; i++ )); do
-        res="$(virsh qemu-agent-command "$Hostname" \
-            "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${pid}}}" 2>/dev/null)"
-        [[ "$res" == *'"exited":true'* ]] && break
-        sleep 2
-    done
-    [[ "$res" == *'"exited":true'* ]] || return 124      # nog bezig: opgegeven
-    GUEST_EXITCODE="$(sed -n 's/.*"exitcode":\([0-9]\{1,\}\).*/\1/p' <<<"$res" | head -1)"
-    out="$(sed -n 's/.*"out-data":"\([^"]*\)".*/\1/p' <<<"$res" | head -1)"
-    [[ -n "$out" ]] && GUEST_OUTPUT="$(base64 -d <<<"$out" 2>/dev/null || true)"
-    [[ "${GUEST_EXITCODE:-1}" == "0" ]]
 }
 
 # Zet een bestand van deze host in de gast neer, in stukken: de hele inhoud
