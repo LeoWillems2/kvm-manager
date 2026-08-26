@@ -134,6 +134,82 @@ Meelezen met een lopende run:
     tail -f logs/makevm-{naam}-laatste.log
     cat    logs/makevm-{naam}.status
 
+## Wat er geïnstalleerd moet zijn
+
+Deze scripts gaan uit van Ubuntu/Debian met libvirt. Het meeste is coreutils
+en staat er toch al; hieronder alleen wat u echt apart moet installeren, met
+per pakket wie het gebruikt en waarvoor.
+
+### Op de host
+
+| pakket | commando | wie | waarvoor |
+|---|---|---|---|
+| `libvirt-daemon-system` | `libvirtd` | alles | de virtualisatielaag zelf |
+| `libvirt-clients` | `virsh` | `makevm.sh`, `snapshot.sh`, `bupvms`, `herstel.sh` | domeinen, netwerken, snapshots, de guest-agent |
+| `virtinst` | `virt-install` | `makevm.sh` | de gast aanmaken |
+| `qemu-utils` | `qemu-img` | `makevm.sh`, `snapshot.sh`, `bupvms`, `herstel.sh` | schijven maken, kopiëren, meten en samenvoegen |
+| `xorriso` | `xorriso` | `makevm.sh` | de cloud-init seed-ISO bouwen |
+| `openssh-client` | `ssh`, `ssh-keygen`, `ssh-keyscan` | `makevm.sh` | wachten op de gast en `known_hosts` bijwerken |
+| `openssl` | `openssl` | `makevm.sh` | de wachtwoordhash voor de beheerder |
+| `util-linux` | `flock` | `snapshot.sh`, `bupvms` | de grendel om de bodem-image |
+| `python3` | `python3` | `herstel.sh` | de hostgebonden delen van `domein.xml` aanpassen |
+| `libguestfs-tools` | `virt-sysprep` | `herstel.sh --sysprep` | identiteit in de schijf vernieuwen bij een kloon |
+
+    sudo apt install libvirt-daemon-system libvirt-clients virtinst qemu-utils \
+                     xorriso openssh-client openssl util-linux python3
+
+`libguestfs-tools` staat bewust niet in die regel: het is alleen nodig voor
+`herstel.sh --sysprep` en het is een fors pakket. **Op deze host staat het
+niet.** `herstel.sh --naam X --nieuwe-identiteit --sysprep` stopt daardoor met
+"virt-sysprep ontbreekt" — de rest van het herstel werkt wel. Wilt u die weg
+gebruiken, dan moet het erbij:
+
+    sudo apt install libguestfs-tools
+
+Dat `makevm.sh` de gast via de qemu-guest-agent bewerkt in plaats van via
+libguestfs komt uit dezelfde hoek: er is op deze host geen libguestfs, en in
+de gast vraagt sudo een wachtwoord.
+
+### Voor `bupdaily` (php)
+
+| pakket | waarvoor |
+|---|---|
+| `php-cli` | `bupdaily` is php, geen bash |
+| `php-mail` | PEAR `Mail` — de dagelijkse mail |
+| `php-net-smtp` | smtps-verbinding voor PEAR Mail |
+| `php-net-socket` | wat `php-net-smtp` daaronder gebruikt |
+| `cron` | de dagelijkse ronde om 03:17 |
+
+    sudo apt install php-cli php-mail php-net-smtp php-net-socket cron
+
+### In de gast
+
+`makevm.sh` installeert dit zelf bij het bouwen; het staat hier omdat een gast
+die op een andere manier is ontstaan het ook nodig heeft.
+
+| pakket | waarvoor |
+|---|---|
+| `qemu-guest-agent` | **de spil.** `snapshot.sh --quiesce` bevriest het filesystem ermee, `makevm.sh` draait er `beveilig.sh` mee in de gast, en `--dump-config` leest de gast er mee uit. Zonder agent is een snapshot hooguit crash-consistent |
+| `openssh-server` | inloggen, en waar `makevm.sh` op wacht |
+| `cloud-init` | naam, IP, MAC, hostsleutels en machine-id van een kloon |
+| `ufw`, `fail2ban` | door `beveilig.sh` gezet en verwacht |
+
+`beveilig.sh` installeert daarbovenop zelf `unattended-upgrades`,
+`apt-listchanges`, `needrestart`, `apparmor`, `apparmor-utils`, `auditd` en
+`audispd-plugins`.
+
+Verder leest `makevm.sh --dump-config` de gast uit met `dpkg-query`,
+`apt-mark`, `resolvectl`, `timedatectl`, `findmnt`, `lsblk` en `ufw`. Die zitten
+alle in een standaard Ubuntu Server; ontbreekt er een, dan blijft die regel in
+het configbestand leeg in plaats van dat het misgaat.
+
+### Wat er níét nodig is
+
+`net-tools` niet — er wordt nergens `netstat`, `ifconfig` of `route`
+aangeroepen; het netwerk gaat overal via `ip` uit `iproute2`. `jq` niet, `curl`
+niet, en geen enkel scanpakket: de scripts lezen `virsh dumpxml` en `dpkg` met
+`sed` en `awk`.
+
 ## Waar het spul staat
 
 Als je andere paden gebruikt dan hieronder moet je de parameters voorin elk
