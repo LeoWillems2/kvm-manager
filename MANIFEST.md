@@ -203,12 +203,6 @@ Verder leest `makevm.sh --dump-config` de gast uit met `dpkg-query`,
 alle in een standaard Ubuntu Server; ontbreekt er een, dan blijft die regel in
 het configbestand leeg in plaats van dat het misgaat.
 
-### Wat er níét nodig is
-
-`net-tools` niet — er wordt nergens `netstat`, `ifconfig` of `route`
-aangeroepen; het netwerk gaat overal via `ip` uit `iproute2`. `jq` niet, `curl`
-niet, en geen enkel scanpakket: de scripts lezen `virsh dumpxml` en `dpkg` met
-`sed` en `awk`.
 
 ## Waar het spul staat
 
