@@ -159,16 +159,12 @@ per pakket wie het gebruikt en waarvoor.
                      xorriso openssh-client openssl util-linux python3
 
 `libguestfs-tools` staat bewust niet in die regel: het is alleen nodig voor
-`herstel.sh --sysprep` en het is een fors pakket. **Op deze host staat het
-niet.** `herstel.sh --naam X --nieuwe-identiteit --sysprep` stopt daardoor met
+`herstel.sh --sysprep` en het is een fors pakket.
+`herstel.sh --naam X --nieuwe-identiteit --sysprep` stopt daardoor met
 "virt-sysprep ontbreekt" — de rest van het herstel werkt wel. Wilt u die weg
 gebruiken, dan moet het erbij:
 
     sudo apt install libguestfs-tools
-
-Dat `makevm.sh` de gast via de qemu-guest-agent bewerkt in plaats van via
-libguestfs komt uit dezelfde hoek: er is op deze host geen libguestfs, en in
-de gast vraagt sudo een wachtwoord.
 
 ### Voor `bupdaily` (php)
 
@@ -202,7 +198,6 @@ Verder leest `makevm.sh --dump-config` de gast uit met `dpkg-query`,
 `apt-mark`, `resolvectl`, `timedatectl`, `findmnt`, `lsblk` en `ufw`. Die zitten
 alle in een standaard Ubuntu Server; ontbreekt er een, dan blijft die regel in
 het configbestand leeg in plaats van dat het misgaat.
-
 
 ## Waar het spul staat
 
