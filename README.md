@@ -12,3 +12,5 @@ Zie MANIFEST.md aan het einde als je deze paden niet hebt:
 
 
 Pas (eenmalig) makevm.sh aan voor alle variabelen in jouw omgeving.
+
+Het script bupdaily is PHP, het heeft package 'Mail.php' nodig.

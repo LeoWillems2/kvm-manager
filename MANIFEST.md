@@ -85,7 +85,7 @@ fout. Een gast die faalt stopt de ronde niet.
 
 Staat in de crontab van root:
 
-    17 3 * * *  /home/leo/claude/makevm-2604/bupdaily josefina >/dev/null 2>&1
+    17 3 * * *  /pad/kvm-manager/bupdaily guest [guest...] >/dev/null 2>&1
 
 ### `herstel.sh`
 Neemt een pakket van `bupvms` op in een libvirt-installatie: kopie
@@ -95,7 +95,7 @@ detail — *uitwijk* (dezelfde machine elders, alles identiek, origineel uit) of
 *kloon* (een tweede exemplaar ernaast, met `--nieuwe-identiteit` en meestal
 `--sysprep`). Past het IP binnen de gast niet aan; dat zit in de schijf.
 
-    sudo ./herstel.sh /t2/kvm-bup/josefina-20260824-131652
+    sudo ./herstel.sh /t2/kvm-bup/website-20260824-131652
     sudo ./herstel.sh --naam proef --nieuwe-identiteit --netwerk default PAKKET
 
 ## Documentatie
